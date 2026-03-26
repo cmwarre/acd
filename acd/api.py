@@ -9,6 +9,7 @@ from pathlib import Path
 from acd.l5x.export_l5x import ExportL5x
 from acd.zip.unzip import Unzip
 from acd.zip.write_acd import write_acd
+from acd.zip.write_dat import patch_sbregion_dat
 
 from acd.database.acd_database import AcdDatabase
 from acd.l5x.elements import DumpCompsRecords, RSLogix5000Content
@@ -55,6 +56,36 @@ def save_acd(project: RSLogix5000Content, output_path) -> None:
         output_path=output_path,
         file_order=project._file_order,
         footer_unknown=project._footer_unknown,
+    )
+
+
+def patch_rungs(project: RSLogix5000Content, changes: dict) -> None:
+    """Patch rung text in a loaded project's SbRegion.Dat in-place.
+
+    Call this before save_acd() to modify ladder rung logic.
+
+    Args:
+        project: Project loaded by load_acd().
+        changes: Mapping of {rung_object_id: new_rung_text}.
+
+            rung_object_id — the integer object_id for the rung.  Available
+            as routine._rung_ids[i] for the i-th rung in a Routine.
+
+            new_rung_text — the new rung text with plain tag names (not
+            @HEX@ placeholders).  Tag names are resolved back to object_id
+            placeholders automatically using project._id_to_name.
+
+    Example:
+        project = load_acd("project.ACD")
+        routine = project.controller.programs[0].routines[0]
+        changes = {routine._rung_ids[0]: "XIC(MyTag)OTE(OutputTag);"}
+        patch_rungs(project, changes)
+        save_acd(project, "modified.ACD")
+    """
+    project._raw_files["SbRegion.Dat"] = patch_sbregion_dat(
+        project._raw_files["SbRegion.Dat"],
+        changes,
+        project._id_to_name,
     )
 
 
