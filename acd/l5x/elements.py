@@ -288,15 +288,19 @@ class DataTypeBuilder(L5xElementBuilder):
             )
             children_results = self._cur.fetchall()
 
-            if member_count != len(children_results):
-                raise Exception("Member and children list arent the same length")
-
+            # Some ACD files have mismatched member_count vs children list — iterate what we have
             for idx, child in enumerate(children_results):
-                children.append(
-                    MemberBuilder(
-                        self._cur, child[1], bytes(extended_records[0x6E + idx])
-                    ).build()
-                )
+                key = 0x6E + idx
+                if key not in extended_records:
+                    break
+                try:
+                    children.append(
+                        MemberBuilder(
+                            self._cur, child[1], bytes(extended_records[key])
+                        ).build()
+                    )
+                except Exception:
+                    pass
 
         return DataType(name, name, string_family, class_type, children)
 
@@ -329,13 +333,20 @@ class MapDeviceBuilder(L5xElementBuilder):
                 extended_record.value
             )
 
-        vendor_id = struct.unpack("<H", extended_records[0x01][2:4])[0]
-        product_type = struct.unpack("<H", extended_records[0x01][4:6])[0]
-        product_code = struct.unpack("<H", extended_records[0x01][6:8])[0]
-        parent_module = struct.unpack("<I", extended_records[0x01][0x16:0x1A])[0]
-        slot_no = struct.unpack("<I", extended_records[0x01][0x1C:0x20])[0]
-        module_id = struct.unpack("<I", extended_records[0x01][0x2C:0x30])[0]
         name = results[0][0]
+        if 0x01 not in extended_records or len(extended_records[0x01]) < 0x30:
+            return MapDevice(name, 0, 0, 0, 0, 0, 0, comment_results)
+
+        try:
+            raw = extended_records[0x01]
+            vendor_id = struct.unpack("<H", raw[2:4])[0]
+            product_type = struct.unpack("<H", raw[4:6])[0]
+            product_code = struct.unpack("<H", raw[6:8])[0]
+            parent_module = struct.unpack("<I", raw[0x16:0x1A])[0]
+            slot_no = struct.unpack("<I", raw[0x1C:0x20])[0]
+            module_id = struct.unpack("<I", raw[0x2C:0x30])[0]
+        except Exception:
+            return MapDevice(name, 0, 0, 0, 0, 0, 0, comment_results)
 
         return MapDevice(
             name,
@@ -391,16 +402,17 @@ class TagBuilder(L5xElementBuilder):
                 extended_record.value
             )
 
+        if 0x01 not in extended_records:
+            return Tag(results[0][0], results[0][0], "Base", data_type, "Decimal", "None", 0, comment_results)
+        name_length = struct.unpack("<H", extended_records[0x01][0:2])[0]
+        name = bytes(extended_records[0x01][2 : name_length + 2]).decode("utf-8", errors="replace")
+
         radix = radix_enum(r.main_record.radix)
-        if 0x01 in extended_records:
-            name_length = struct.unpack("<H", extended_records[0x01][0:2])[0]
-            name = bytes(extended_records[0x01][2 : name_length + 2]).decode("utf-8")
-            external_access = external_access_enum(
-                struct.unpack_from("<H", extended_records[0x01], 0x21E)[0]
-            )
-        else:
-            name = results[0][0]
-            external_access = "Read/Write"
+        try:
+            name_length_raw = struct.unpack_from("<H", extended_records[0x01], 0x21E)[0]
+            external_access = external_access_enum(name_length_raw)
+        except Exception:
+            external_access = "None"
 
         if r.main_record.dimension_1 != 0:
             data_type = data_type + "[" + str(r.main_record.dimension_1) + "]"
@@ -605,17 +617,22 @@ class ControllerBuilder(L5xElementBuilder):
                 extended_record.value
             )
 
-        comm_path = bytes(extended_records[0x6A][:-2]).decode("utf-16")
-        sfc_execution_control = bytes(extended_records[0x6F][:-2]).decode("utf-16")
-        sfc_restart_position = bytes(extended_records[0x70][:-2]).decode("utf-16")
-        sfc_last_scan = bytes(extended_records[0x71][:-2]).decode("utf-16")
+        def _decode_utf16(key):
+            raw = extended_records.get(key)
+            if raw is None or len(raw) < 2:
+                return ""
+            return bytes(raw[:-2]).decode("utf-16", errors="replace")
 
-        serial_number_raw = hex(struct.unpack("<I", extended_records[0x75])[0])[
-            2:
-        ].zfill(8)
-        serial_number = (
-            f"16#{serial_number_raw[:4].upper()}_{serial_number_raw[4:].upper()}"
-        )
+        comm_path = _decode_utf16(0x6A)
+        sfc_execution_control = _decode_utf16(0x6F)
+        sfc_restart_position = _decode_utf16(0x70)
+        sfc_last_scan = _decode_utf16(0x71)
+
+        if 0x75 in extended_records:
+            serial_number_raw = hex(struct.unpack("<I", extended_records[0x75])[0])[2:].zfill(8)
+            serial_number = f"16#{serial_number_raw[:4].upper()}_{serial_number_raw[4:].upper()}"
+        else:
+            serial_number = "Unknown"
 
         raw_modified_date = struct.unpack("<Q", extended_records[0x66])[0] / 10000000
         epoch_modified_date = datetime(1601, 1, 1) + timedelta(
