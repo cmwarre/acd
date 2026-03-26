@@ -369,7 +369,7 @@ class DataTypeBuilder(L5xElementBuilder):
         class_type = "User"
         if module_defined > 0:
             class_type = "IO"
-        if built_in > 0:
+        if built_in & 0x03:
             class_type = "ProductDefined"
         if 0x64 in extended_records and len(extended_records[0x64]) == 0x04:
             member_count = struct.unpack("<I", extended_records[0x64])[0]
