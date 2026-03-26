@@ -44,6 +44,8 @@ class ExportL5x:
         self._db = sqlite3.connect(
             os.path.join(self._temp_dir, _DEFAULT_SQL_DATABASE_NAME)
         )
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("PRAGMA synchronous=OFF")
         self._cur: Cursor = self._db.cursor()
 
         log.debug("Create Comps table in sqllite db")
@@ -78,20 +80,17 @@ class ExportL5x:
 
         log.info("Getting records from ACD Comps file and storing in sqllite database")
         comps_db = DbExtract(os.path.join(self._temp_dir, "Comps.Dat")).read()
+        # Deduplicate by object_id (last occurrence wins, matching original behavior)
+        comps_by_id = {}
         for record in comps_db.records.record:
-            CompsRecord(self._cur, record)
+            t = CompsRecord.parse(record)
+            if t is not None:
+                comps_by_id[t[0]] = t
+        self._cur.executemany("INSERT INTO comps VALUES (?,?,?,?,?,?)", comps_by_id.values())
         self._db.commit()
 
-        # Get a list of class ids for each collection
-        # self._cur.execute("SELECT object_id, comp_name, record FROM comps WHERE parent_id=" + str(4240912631))
-        # results = self._cur.fetchall()
-        # classes = [[]]
-        # for result in results:
-        #     name = result[1]
-        #     cip_class = hex(struct.unpack(
-        #         "H", result[2][10: 10 + 2]
-        #     )[0])
-        #     classes.append([name, cip_class])
+        # Build name lookup for SbRegion tag reference resolution (object_id → comp_name)
+        name_lookup = {oid: t[2] for oid, t in comps_by_id.items()}
 
         log.info(
             "Getting records from ACD Region Map file and storing in sqllite database"
@@ -102,24 +101,33 @@ class ExportL5x:
             "Getting records from ACD SbRegion file and storing in sqllite database"
         )
         sb_region_db = DbExtract(os.path.join(self._temp_dir, "SbRegion.Dat")).read()
-        for record in sb_region_db.records.record:
-            SbRegionRecord(self._cur, record)
+        rung_tuples = [t for record in sb_region_db.records.record if (t := SbRegionRecord.parse(record, name_lookup)) is not None]
+        self._cur.executemany("INSERT INTO rungs VALUES (?,?,?)", rung_tuples)
         self._db.commit()
 
         log.info(
             "Getting records from ACD Comments file and storing in sqllite database"
         )
         comments_db = DbExtract(os.path.join(self._temp_dir, "Comments.Dat")).read()
-        for record in comments_db.records.record:
-            CommentsRecord(self._cur, record)
+        comment_tuples = [t for record in comments_db.records.record if (t := CommentsRecord.parse(record)) is not None]
+        self._cur.executemany("INSERT INTO comments VALUES (?,?,?,?,?,?,?)", comment_tuples)
         self._db.commit()
 
         log.info(
             "Getting records from ACD Nameless file and storing in sqllite database"
         )
         nameless_db = DbExtract(os.path.join(self._temp_dir, "Nameless.Dat")).read()
-        for record in nameless_db.records.record:
-            NamelessRecord(self._cur, record)
+        nameless_tuples = [t for record in nameless_db.records.record if (t := NamelessRecord.parse(record)) is not None]
+        self._cur.executemany("INSERT INTO nameless VALUES (?,?,?)", nameless_tuples)
+        self._db.commit()
+
+        log.info("Creating indexes for fast object graph queries")
+        self._cur.execute("CREATE INDEX idx_comps_object_id ON comps(object_id)")
+        self._cur.execute("CREATE INDEX idx_comps_parent_id ON comps(parent_id)")
+        self._cur.execute("CREATE INDEX idx_comps_parent_name ON comps(parent_id, comp_name)")
+        self._cur.execute("CREATE INDEX idx_rungs_object_id ON rungs(object_id)")
+        self._cur.execute("CREATE INDEX idx_region_map_parent_id ON region_map(parent_id)")
+        self._cur.execute("CREATE INDEX idx_comments_parent ON comments(parent)")
         self._db.commit()
 
     @property
@@ -188,7 +196,7 @@ class ExportL5x:
             self._cur.execute(query, enty)
             identifier_offset += 16
 
-            self._db.commit()
+        self._db.commit()
 
 
 if __name__ == "__main__":
