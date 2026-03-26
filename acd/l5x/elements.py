@@ -27,6 +27,8 @@ _LIST_SECTION_NAMES = {
     "programs": "Programs",
     "routines": "Routines",
     "aois": "AddOnInstructionDefinitions",
+    "tasks": "Tasks",
+    "scheduled_programs": "ScheduledPrograms",
 }
 
 
@@ -43,6 +45,8 @@ class L5xElement:
         for attribute in self.__dict__:
             if attribute[0] != "_":
                 attribute_value = self.__getattribute__(attribute)
+                if attribute_value is None:
+                    continue
                 if isinstance(attribute_value, L5xElement):
                     child_list.append(attribute_value.to_xml())
                 elif isinstance(attribute_value, list):
@@ -142,6 +146,38 @@ class Program(L5xElement):
 
 
 @dataclass
+class ScheduledProgram(L5xElement):
+    name: str
+
+    def __post_init__(self):
+        super().__post_init__()
+        self._export_name = "ScheduledProgram"
+
+
+@dataclass
+class EventInfo(L5xElement):
+    event_trigger: str
+    enable_timeout: str
+
+    def __post_init__(self):
+        super().__post_init__()
+        self._export_name = "EventInfo"
+
+
+@dataclass
+class Task(L5xElement):
+    name: str
+    type: str
+    rate: Union[str, None]  # None for CONTINUOUS tasks (omitted from XML)
+    priority: str
+    watchdog: str
+    disable_update_outputs: str
+    inhibit_task: str
+    event_info: Union[EventInfo, None]  # None for non-EVENT tasks
+    scheduled_programs: List[ScheduledProgram]
+
+
+@dataclass
 class Controller(L5xElement):
     serial_number: str
     comm_path: str
@@ -153,6 +189,7 @@ class Controller(L5xElement):
     data_types: List[DataType]
     tags: List[Tag]
     programs: List[Program]
+    tasks: List[Task]
     aois: List[AOI]
     map_devices: List[MapDevice]
 
@@ -605,6 +642,57 @@ class ProgramBuilder(L5xElementBuilder):
         return Program(name, name, routines, tags)
 
 
+_TASK_TYPE_MAP = {1: "EVENT", 2: "PERIODIC", 4: "CONTINUOUS"}
+
+
+@dataclass
+class TaskBuilder(L5xElementBuilder):
+    def build(self, comment_id_to_program: Dict[int, str]) -> Task:
+        self._cur.execute(
+            "SELECT comp_name, record FROM comps WHERE object_id=" + str(self._object_id)
+        )
+        row = self._cur.fetchone()
+        name, record = row[0], row[1]
+
+        # All task config fields live within ext[0x01], accessed via absolute BLOB offsets.
+        # These offsets were reverse-engineered from CIPDemo_RevEng.ACD.
+        rate_us = struct.unpack_from("<I", record, 0x106C)[0]
+        type_val = struct.unpack_from("<H", record, 0x10F6)[0]
+        priority = struct.unpack_from("<H", record, 0x10F8)[0]
+        watchdog_us = struct.unpack_from("<I", record, 0x110A)[0]
+        disable_update = record[0x112E]
+
+        task_type = _TASK_TYPE_MAP.get(type_val, "PERIODIC")
+        rate_str = str(rate_us // 1000) if task_type != "CONTINUOUS" else None
+
+        # Scheduled programs: ext[0x01] value starts at BLOB offset 0x5A.
+        # Format: u16 count followed by N u32 comment_ids.
+        prog_count = struct.unpack_from("<H", record, 0x5A)[0]
+        scheduled_programs = []
+        for i in range(prog_count):
+            cid = struct.unpack_from("<I", record, 0x5A + 2 + i * 4)[0]
+            prog_name = comment_id_to_program.get(cid)
+            if prog_name:
+                scheduled_programs.append(ScheduledProgram(prog_name, prog_name))
+
+        event_info = None
+        if task_type == "EVENT":
+            event_info = EventInfo("EventInfo", "EVENT Instruction Only", "false")
+
+        return Task(
+            name,
+            name,
+            task_type,
+            rate_str,
+            str(priority),
+            str(watchdog_us // 1000),
+            "true" if disable_update else "false",
+            "false",
+            event_info,
+            scheduled_programs,
+        )
+
+
 @dataclass
 class ControllerBuilder(L5xElementBuilder):
     def build(self) -> Controller:
@@ -720,6 +808,34 @@ class ControllerBuilder(L5xElementBuilder):
             _program_object_id = result[1]
             programs.append(ProgramBuilder(self._cur, _program_object_id).build())
 
+        # Build comment_id → program name map for task scheduled-program resolution.
+        # comment_id is a u16 at BLOB offset 0x0C in each program's RxGeneric record.
+        self._cur.execute(
+            "SELECT comp_name, record FROM comps WHERE parent_id=" + str(_program_collection_object_id)
+        )
+        comment_id_to_program: Dict[int, str] = {
+            struct.unpack_from("<H", rec, 0x0C)[0]: pname
+            for pname, rec in self._cur.fetchall()
+        }
+
+        # Get the Task Collection and build Tasks
+        self._cur.execute(
+            "SELECT comp_name, object_id FROM comps WHERE parent_id="
+            + str(self._object_id)
+            + " AND comp_name='RxTaskCollection'"
+        )
+        task_coll_results = self._cur.fetchall()
+        tasks: List[Task] = []
+        if task_coll_results:
+            _task_collection_object_id = task_coll_results[0][1]
+            self._cur.execute(
+                "SELECT comp_name, object_id FROM comps WHERE parent_id="
+                + str(_task_collection_object_id)
+                + " AND record_type=256"
+            )
+            for task_result in self._cur.fetchall():
+                tasks.append(TaskBuilder(self._cur, task_result[1]).build(comment_id_to_program))
+
         # Get the AOI Collection and get the AOIs
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record_type FROM comps WHERE parent_id="
@@ -774,6 +890,7 @@ class ControllerBuilder(L5xElementBuilder):
             data_types,
             tags,
             programs,
+            tasks,
             aois,
             map_devices,
         )
