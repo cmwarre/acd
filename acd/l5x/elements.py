@@ -391,12 +391,16 @@ class TagBuilder(L5xElementBuilder):
                 extended_record.value
             )
 
-        name_length = struct.unpack("<H", extended_records[0x01][0:2])[0]
-        name = bytes(extended_records[0x01][2 : name_length + 2]).decode("utf-8")
-
         radix = radix_enum(r.main_record.radix)
-        name_length_raw = struct.unpack_from("<H", extended_records[0x01], 0x21E)[0]
-        external_access = external_access_enum(name_length_raw)
+        if 0x01 in extended_records:
+            name_length = struct.unpack("<H", extended_records[0x01][0:2])[0]
+            name = bytes(extended_records[0x01][2 : name_length + 2]).decode("utf-8")
+            external_access = external_access_enum(
+                struct.unpack_from("<H", extended_records[0x01], 0x21E)[0]
+            )
+        else:
+            name = results[0][0]
+            external_access = "Read/Write"
 
         if r.main_record.dimension_1 != 0:
             data_type = data_type + "[" + str(r.main_record.dimension_1) + "]"
@@ -455,19 +459,11 @@ class RoutineBuilder(L5xElementBuilder):
         )
 
         self._cur.execute(
-            "SELECT object_id, parent_id, seq_no FROM region_map WHERE parent_id="
-            + str(self._object_id)
-            + " ORDER BY seq_no"
+            "SELECT rm.object_id, r.rung FROM region_map rm "
+            "LEFT JOIN rungs r ON r.object_id = rm.object_id "
+            "WHERE rm.parent_id=" + str(self._object_id) + " ORDER BY rm.seq_no"
         )
-        results = self._cur.fetchall()
-        rungs = []
-        for member in results:
-            self._cur.execute(
-                "SELECT object_id, rung FROM rungs WHERE object_id=" + str(member[0])
-            )
-            rungs_results = self._cur.fetchall()
-            if len(rungs_results) > 0:
-                rungs.append(rungs_results[0][1])
+        rungs = [row[1] for row in self._cur.fetchall() if row[1] is not None]
         return Routine(name, name, routine_type, rungs)
 
 

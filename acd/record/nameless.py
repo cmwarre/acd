@@ -1,6 +1,7 @@
 import struct
 from dataclasses import dataclass
 from sqlite3 import Cursor
+from typing import Optional
 
 from acd.database.dbextract import DatRecord
 
@@ -11,24 +12,15 @@ class NamelessRecord:
     dat_record: DatRecord
 
     def __post_init__(self):
-        if self.dat_record.identifier == 64250:
-            identifier_offset = 8
-            self.identifier = struct.unpack(
-                "I",
-                self.dat_record.record.record_buffer[
-                    identifier_offset : identifier_offset + 4
-                ],
-            )[0]
+        entry = NamelessRecord.parse(self.dat_record)
+        if entry is not None:
+            self._cur.execute("INSERT INTO nameless VALUES (?, ?, ?)", entry)
 
-            object_identifier_offset = 0x0C
-            self.object_identifier = struct.unpack_from(
-                "<I", self.dat_record.record.record_buffer, object_identifier_offset
-            )[0]
-
-            query: str = "INSERT INTO nameless VALUES (?, ?, ?)"
-            enty: tuple = (
-                self.object_identifier,
-                self.identifier,
-                self.dat_record.record.record_buffer,
-            )
-            self._cur.execute(query, enty)
+    @staticmethod
+    def parse(dat_record: DatRecord) -> Optional[tuple]:
+        if dat_record.identifier != 64250:
+            return None
+        buf = dat_record.record.record_buffer
+        identifier = struct.unpack("I", buf[8:12])[0]
+        object_identifier = struct.unpack_from("<I", buf, 0x0C)[0]
+        return (object_identifier, identifier, buf)

@@ -1,6 +1,7 @@
 import re
 from dataclasses import dataclass
 from sqlite3 import Cursor
+from typing import Optional
 
 from acd.database.dbextract import DatRecord
 from acd.generated.comments.fafa_coments import FafaComents
@@ -12,46 +13,31 @@ class CommentsRecord:
     dat_record: DatRecord
 
     def __post_init__(self):
-        if self.dat_record.identifier == 64250:
-            r = FafaComents.from_bytes(self.dat_record.record.record_buffer)
-            pass
-        else:
-            return
+        entry = CommentsRecord.parse(self.dat_record)
+        if entry is not None:
+            self._cur.execute("INSERT INTO comments VALUES (?, ?, ?, ?, ?, ?, ?)", entry)
 
-        query: str = "INSERT INTO comments VALUES (?, ?, ?, ?, ?, ?, ?)"
-        if (
-            (r.header.record_type == 0x03)
-            or (r.header.record_type == 0x04)
-            or (r.header.record_type == 0x0D)
-            or (r.header.record_type == 0x0E)
-        ):
-            try:
-                entry: tuple = (
-                    r.header.seq_number,
-                    r.header.sub_record_length,
-                    r.body.object_id,
-                    r.body.record_string,
-                    r.header.record_type,
-                    r.header.parent,
-                    r.body.tag_reference.value,
-                )
-                self._cur.execute(query, entry)
-            except Exception as e:
-                pass
-        else:
-            try:
-                entry: tuple = (
-                    r.header.seq_number,
-                    r.header.sub_record_length,
-                    r.body.object_id,
-                    r.body.record_string,
-                    r.header.record_type,
-                    r.header.parent,
-                    "",
-                )
-                self._cur.execute(query, entry)
-            except Exception as e:
-                pass
+    @staticmethod
+    def parse(dat_record: DatRecord) -> Optional[tuple]:
+        if dat_record.identifier != 64250:
+            return None
+        try:
+            r = FafaComents.from_bytes(dat_record.record.record_buffer)
+            if r.header.record_type in (0x03, 0x04, 0x0D, 0x0E):
+                tag_ref = r.body.tag_reference.value
+            else:
+                tag_ref = ""
+            return (
+                r.header.seq_number,
+                r.header.sub_record_length,
+                r.body.object_id,
+                r.body.record_string,
+                r.header.record_type,
+                r.header.parent,
+                tag_ref,
+            )
+        except Exception:
+            return None
 
     def replace_tag_references(self, sb_rec):
         m = re.findall("@[A-Za-z0-9]*@", sb_rec)
