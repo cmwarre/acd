@@ -1,4 +1,5 @@
 import os
+import xml.dom.minidom
 from abc import abstractmethod
 from dataclasses import dataclass
 from os import PathLike
@@ -133,3 +134,43 @@ class DumpCompsRecordsToFile(ExportProject):
             "w",
         ) as log_file:
             DumpCompsRecords(export._cur, 0).dump(log_file=log_file)
+
+
+@dataclass
+class ConvertAcdToL5x(Extract):
+    """Convert an ACD file to an L5X XML file.
+
+    Parses the ACD binary databases (Comps.Dat, SbRegion.Dat, Comments.Dat)
+    and serialises the in-memory project model to an L5X-compatible XML file
+    that can be imported back into Studio 5000 Logix Designer.
+
+    The output captures controller tags, programs, routines (ladder rungs),
+    data types (UDTs), add-on instructions (AOIs), and hardware modules.
+
+    :param PathLike acd_filename: Path to the source .ACD file.
+    :param PathLike l5x_filename: Path for the output .L5X file.
+    :param bool pretty_print: Pretty-print the XML output (default True).
+    """
+
+    acd_filename: PathLike
+    l5x_filename: PathLike
+    pretty_print: bool = True
+
+    def extract(self):
+        project = ImportProjectFromFile(self.acd_filename).import_project()
+        raw_xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + project.to_xml()
+        if self.pretty_print:
+            try:
+                dom = xml.dom.minidom.parseString(raw_xml.encode("utf-8"))
+                output = dom.toprettyxml(indent="  ", encoding="UTF-8").decode("utf-8")
+                # minidom adds its own XML declaration; strip the duplicate header
+                lines = output.splitlines()
+                if lines and lines[0].startswith("<?xml"):
+                    lines[0] = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                output = "\n".join(lines)
+            except Exception:
+                output = raw_xml
+        else:
+            output = raw_xml
+        with open(self.l5x_filename, "w", encoding="utf-8") as f:
+            f.write(output)
