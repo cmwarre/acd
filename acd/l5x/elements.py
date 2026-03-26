@@ -152,6 +152,11 @@ class AOI(L5xElement):
 @dataclass
 class Program(L5xElement):
     name: str
+    test_edits: str
+    main_routine_name: Union[str, None]  # None if absent (omitted from XML)
+    fault_routine_name: Union[str, None]  # None if absent (omitted from XML)
+    disabled: str
+    use_as_folder: str
     routines: List[Routine]
     tags: List[Tag]
 
@@ -710,9 +715,28 @@ class ProgramBuilder(L5xElementBuilder):
         )
         results = self._cur.fetchall()
 
-        r = RxGeneric.from_bytes(results[0][3])
+        prog_record = bytes(results[0][3])
+        r = RxGeneric.from_bytes(prog_record)
 
         name = results[0][0]
+
+        # --- MainRoutineName and FaultRoutineName from extended records ---
+        # ext[0x12D] = MainRoutine object_id, ext[0x066] = FaultRoutine object_id
+        exts: Dict[int, bytes] = {e.attribute_id: bytes(e.value) for e in r.extended_records}
+        main_routine_name: Union[str, None] = None
+        fault_routine_name: Union[str, None] = None
+        if 0x12D in exts and len(exts[0x12D]) >= 4:
+            main_oid = struct.unpack_from("<I", exts[0x12D], 0)[0]
+            if main_oid:
+                self._cur.execute("SELECT comp_name FROM comps WHERE object_id=" + str(main_oid))
+                row = self._cur.fetchone()
+                main_routine_name = row[0] if row else None
+        if 0x066 in exts and len(exts[0x066]) >= 4:
+            fault_oid = struct.unpack_from("<I", exts[0x066], 0)[0]
+            if fault_oid:
+                self._cur.execute("SELECT comp_name FROM comps WHERE object_id=" + str(fault_oid))
+                row = self._cur.fetchone()
+                fault_routine_name = row[0] if row else None
 
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record FROM comps WHERE parent_id="
@@ -757,7 +781,8 @@ class ProgramBuilder(L5xElementBuilder):
         )
         comment_results = self._cur.fetchall()
 
-        return Program(name, name, routines, tags)
+        return Program(name, name, "false", main_routine_name, fault_routine_name,
+                       "false", "false", routines, tags)
 
 
 _TASK_TYPE_MAP = {1: "EVENT", 2: "PERIODIC", 4: "CONTINUOUS"}
