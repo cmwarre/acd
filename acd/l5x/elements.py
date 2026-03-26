@@ -130,6 +130,17 @@ class Routine(L5xElement):
 @dataclass
 class AOI(L5xElement):
     name: str
+    revision: str
+    revision_extension: Union[str, None]  # None if absent (omitted from XML)
+    vendor: Union[str, None]  # None if absent (omitted from XML)
+    execute_prescan: str
+    execute_postscan: str
+    execute_enable_in_false: str
+    created_date: str
+    created_by: str
+    edited_date: str
+    edited_by: str
+    software_revision: str
     routines: List[Routine]
     tags: List[Tag]
 
@@ -527,6 +538,75 @@ class RoutineBuilder(L5xElementBuilder):
         return Routine(name, name, routine_type, rungs, rung_ids)
 
 
+def _parse_fffeff(data: bytes, offset: int):
+    """Parse one fffeff-encoded string at offset. Returns (str, new_offset)."""
+    if offset + 3 > len(data) or not (data[offset] == 0xFF and data[offset+1] == 0xFE and data[offset+2] == 0xFF):
+        return "", offset
+    length = data[offset+3]
+    s = data[offset+4:offset+4+length*2].decode("utf-16-le", errors="replace")
+    return s, offset + 4 + length * 2
+
+
+def _parse_aoi_nameless(data: bytes) -> dict:
+    """Extract AOI metadata from its large nameless record."""
+    result: dict = {}
+
+    offset = 0x1A
+    # Three empty fffeff strings
+    for _ in range(3):
+        _, offset = _parse_fffeff(data, offset)
+
+    # 8 bytes (unknown - some kind of date, skip)
+    offset += 8
+
+    # 2-byte constant (0x0002 observed)
+    offset += 2
+
+    # CreatedBy
+    result["created_by"], offset = _parse_fffeff(data, offset)
+
+    # Software revision at creation time (skip - we want the current one later)
+    _, offset = _parse_fffeff(data, offset)
+
+    # 4 zero bytes
+    offset += 4
+
+    # Empty fffeff placeholder
+    _, offset = _parse_fffeff(data, offset)
+
+    # CreatedDate FILETIME (8 bytes, Windows FILETIME in 100-ns units)
+    ft = struct.unpack_from("<Q", data, offset)[0]
+    if ft:
+        dt = datetime(1601, 1, 1) + timedelta(microseconds=ft // 10)
+        result["created_date"] = dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+    else:
+        result["created_date"] = ""
+    offset += 8
+
+    # EditedBy
+    result["edited_by"], offset = _parse_fffeff(data, offset)
+
+    # SoftwareRevision (current)
+    result["software_revision"], offset = _parse_fffeff(data, offset)
+
+    # 4 bytes (01 00 00 00)
+    offset += 4
+
+    # RevisionExtension
+    rev_ext, offset = _parse_fffeff(data, offset)
+    result["revision_extension"] = rev_ext or None
+
+    # EditedDate FILETIME (always last 8 bytes)
+    ft = struct.unpack_from("<Q", data, len(data) - 8)[0]
+    if ft:
+        dt = datetime(1601, 1, 1) + timedelta(microseconds=ft // 10)
+        result["edited_date"] = dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+    else:
+        result["edited_date"] = ""
+
+    return result
+
+
 @dataclass
 class AoiBuilder(L5xElementBuilder):
     def build(self) -> AOI:
@@ -536,8 +616,35 @@ class AoiBuilder(L5xElementBuilder):
         )
         results = self._cur.fetchall()
 
-        record = results[0][3]
+        aoi_record = bytes(results[0][3])
         name = results[0][0]
+
+        # --- Revision (major.minor) from ext[0x01] ---
+        try:
+            r = RxGeneric.from_bytes(aoi_record)
+            exts: Dict[int, bytes] = {e.attribute_id: bytes(e.value) for e in r.extended_records}
+            e01 = exts.get(0x01, b"")
+            rev_major = struct.unpack_from("<H", e01, 0x1A)[0] if len(e01) > 0x1B else 1
+            rev_minor = struct.unpack_from("<H", e01, 0x1C)[0] if len(e01) > 0x1D else 0
+        except Exception:
+            rev_major, rev_minor = 1, 0
+        revision = f"{rev_major}.{rev_minor}"
+
+        # --- Vendor from comps record ---
+        vlen = struct.unpack_from("<H", aoi_record, 0xA6)[0] if len(aoi_record) > 0xA8 else 0
+        vendor: Union[str, None] = aoi_record[0xA8:0xA8+vlen].decode("utf-8", errors="replace") if vlen > 0 else None
+
+        # --- Metadata from large nameless record ---
+        self._cur.execute(
+            "SELECT record FROM nameless WHERE parent_id=" + str(self._object_id)
+            + " ORDER BY LENGTH(record) DESC LIMIT 1"
+        )
+        nameless_row = self._cur.fetchone()
+        if nameless_row and len(bytes(nameless_row[0])) > 50:
+            meta = _parse_aoi_nameless(bytes(nameless_row[0]))
+        else:
+            meta = {"created_by": "", "created_date": "", "edited_by": "", "edited_date": "",
+                    "software_revision": "", "revision_extension": None}
 
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record FROM comps WHERE parent_id="
@@ -550,7 +657,11 @@ class AoiBuilder(L5xElementBuilder):
         if len(collection_results) != 0:
             collection_id = collection_results[0][1]
         else:
-            return AOI(name, name, routines, tags)
+            return AOI(name, name, revision, meta["revision_extension"], vendor,
+                       "false", "false", "false",
+                       meta["created_date"], meta["created_by"],
+                       meta["edited_date"], meta["edited_by"],
+                       meta["software_revision"], routines, tags)
 
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record FROM comps WHERE parent_id="
@@ -561,26 +672,33 @@ class AoiBuilder(L5xElementBuilder):
         for child in routine_results:
             routines.append(RoutineBuilder(self._cur, child[1]).build())
 
-        # Get the Program Scoped Tags
+        # Get the AOI-Scoped Tags
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record_type FROM comps WHERE parent_id="
             + str(self._object_id)
             + " AND comp_name='RxTagCollection'"
         )
-        results = self._cur.fetchall()
-        if len(results) > 1:
-            raise Exception("Contains more than one program tag collection")
+        tag_coll = self._cur.fetchall()
+        if len(tag_coll) > 1:
+            raise Exception("Contains more than one AOI tag collection")
 
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record_type FROM comps WHERE parent_id="
-            + str(results[0][1])
+            + str(tag_coll[0][1])
         )
-        results = self._cur.fetchall()
-
-        for result in results:
+        for result in self._cur.fetchall():
             tags.append(TagBuilder(self._cur, result[1]).build())
 
-        return AOI(name, name, routines, tags)
+        return AOI(
+            name, name, revision,
+            meta["revision_extension"],
+            vendor,
+            "false", "false", "false",
+            meta["created_date"], meta["created_by"],
+            meta["edited_date"], meta["edited_by"],
+            meta["software_revision"],
+            routines, tags,
+        )
 
 
 @dataclass
