@@ -67,8 +67,10 @@ class L5xElement:
                         attribute = "class"
                     if isinstance(attribute_value, bool):
                         attribute_value = str(attribute_value).lower()
+                    _overrides = getattr(self, "_xml_attr_overrides", {})
+                    xml_attr_name = _overrides.get(attribute, attribute.title().replace("_", ""))
                     attribute_list.append(
-                        f'{attribute.title().replace("_", "")}="{attribute_value}"'
+                        f'{xml_attr_name}="{attribute_value}"'
                     )
 
         _export_name = (
@@ -197,19 +199,43 @@ class Task(L5xElement):
 
 @dataclass
 class Controller(L5xElement):
-    serial_number: str
-    comm_path: str
+    use: str
+    name: str
+    processor_type: Union[str, None]  # None if unknown (omitted from XML)
+    major_rev: str
+    minor_rev: str
+    major_fault_program: Union[str, None]  # None if not set (omitted from XML)
+    project_creation_date: str
+    last_modified_date: str
     sfc_execution_control: str
     sfc_restart_position: str
     sfc_last_scan: str
-    created_date: str
-    modified_date: str
+    project_sn: str
+    match_project_to_controller: str
+    can_use_rpi_from_producer: str
+    inhibit_automatic_firmware_update: str
+    pass_through_configuration: str
+    download_project_documentation_and_extended_properties: str
+    download_project_custom_properties: str
+    report_minor_overflow: str
+    auto_diags_enabled: str
+    web_server_enabled: str
     data_types: List[DataType]
     tags: List[Tag]
     programs: List[Program]
     tasks: List[Task]
     aois: List[AOI]
     map_devices: List[MapDevice]
+
+    def __post_init__(self):
+        super().__post_init__()
+        self._xml_attr_overrides = {
+            "sfc_execution_control": "SFCExecutionControl",
+            "sfc_restart_position": "SFCRestartPosition",
+            "sfc_last_scan": "SFCLastScan",
+            "project_sn": "ProjectSN",
+            "can_use_rpi_from_producer": "CanUseRPIFromProducer",
+        }
 
 
 @dataclass
@@ -861,27 +887,36 @@ class ControllerBuilder(L5xElementBuilder):
                 extended_record.value
             )
 
-        comm_path = bytes(extended_records[0x6A][:-2]).decode("utf-16")
         sfc_execution_control = bytes(extended_records[0x6F][:-2]).decode("utf-16")
         sfc_restart_position = bytes(extended_records[0x70][:-2]).decode("utf-16")
         sfc_last_scan = bytes(extended_records[0x71][:-2]).decode("utf-16")
 
-        serial_number_raw = hex(struct.unpack("<I", extended_records[0x75])[0])[
-            2:
-        ].zfill(8)
-        serial_number = (
-            f"16#{serial_number_raw[:4].upper()}_{serial_number_raw[4:].upper()}"
-        )
+        sn_raw = hex(struct.unpack("<I", extended_records[0x75])[0])[2:].zfill(8)
+        project_sn = f"16#{sn_raw[:4]}_{sn_raw[4:]}"
 
         raw_modified_date = struct.unpack("<Q", extended_records[0x66])[0] / 10000000
-        epoch_modified_date = datetime(1601, 1, 1) + timedelta(
-            seconds=raw_modified_date
-        )
-        modified_date = epoch_modified_date.strftime("%a %b %d %H:%M:%S %Y")
+        last_modified_date = (
+            datetime(1601, 1, 1) + timedelta(seconds=raw_modified_date)
+        ).strftime("%a %b %d %H:%M:%S %Y")
 
         raw_created_date = struct.unpack("<Q", extended_records[0x65])[0] / 10000000
-        epoch_created_date = datetime(1601, 1, 1) + timedelta(seconds=raw_created_date)
-        created_date = epoch_created_date.strftime("%a %b %d %H:%M:%S %Y")
+        project_creation_date = (
+            datetime(1601, 1, 1) + timedelta(seconds=raw_created_date)
+        ).strftime("%a %b %d %H:%M:%S %Y")
+
+        # MajorRev and MinorRev from ext[0x076] bytes[3] and [2]
+        rev_bytes = extended_records.get(0x076, b"\x00\x00\x00\x00")
+        major_rev = str(rev_bytes[3]) if len(rev_bytes) >= 4 else "0"
+        minor_rev = str(rev_bytes[2]) if len(rev_bytes) >= 3 else "0"
+
+        # MajorFaultProgram from ext[0x068] OID → comp_name lookup
+        major_fault_program: Union[str, None] = None
+        if 0x068 in extended_records and len(extended_records[0x068]) >= 4:
+            mfp_oid = struct.unpack_from("<I", extended_records[0x068])[0]
+            if mfp_oid and mfp_oid != 0xFFFFFFFF:
+                self._cur.execute("SELECT comp_name FROM comps WHERE object_id=" + str(mfp_oid))
+                mfp_row = self._cur.fetchone()
+                major_fault_program = mfp_row[0] if mfp_row else None
 
         self._object_id = results[0][1]
         controller_name = results[0][0]
@@ -1025,13 +1060,27 @@ class ControllerBuilder(L5xElementBuilder):
 
         return Controller(
             controller_name,
-            serial_number,
-            comm_path,
+            "Target",
+            controller_name,
+            None,           # ProcessorType: not found in binary (omitted from XML)
+            major_rev,
+            minor_rev,
+            major_fault_program,
+            project_creation_date,
+            last_modified_date,
             sfc_execution_control,
             sfc_restart_position,
             sfc_last_scan,
-            created_date,
-            modified_date,
+            project_sn,
+            "false",        # MatchProjectToController
+            "false",        # CanUseRPIFromProducer
+            "0",            # InhibitAutomaticFirmwareUpdate
+            "EnabledWithAppend",  # PassThroughConfiguration
+            "true",         # DownloadProjectDocumentationAndExtendedProperties
+            "true",         # DownloadProjectCustomProperties
+            "false",        # ReportMinorOverflow
+            "false",        # AutoDiagsEnabled
+            "false",        # WebServerEnabled
             data_types,
             tags,
             programs,
