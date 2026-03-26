@@ -18,6 +18,18 @@ class L5xElementBuilder:
     _object_id: int = -1
 
 
+# Maps Python attribute names to L5X XML section wrapper tag names.
+# Entries here also control which list attributes are serialized as child sections.
+_LIST_SECTION_NAMES = {
+    "tags": "Tags",
+    "data_types": "DataTypes",
+    "members": "Members",
+    "programs": "Programs",
+    "routines": "Routines",
+    "aois": "AddOnInstructionDefinitions",
+}
+
+
 @dataclass
 class L5xElement:
     _name: str
@@ -34,13 +46,8 @@ class L5xElement:
                 if isinstance(attribute_value, L5xElement):
                     child_list.append(attribute_value.to_xml())
                 elif isinstance(attribute_value, list):
-                    if (
-                        attribute == "tags"
-                        or attribute == "data_types"
-                        or attribute == "members"
-                        or attribute == "programs"
-                        or attribute == "routines"
-                    ):
+                    if attribute in _LIST_SECTION_NAMES:
+                        section_name = _LIST_SECTION_NAMES[attribute]
                         new_child_list: List[str] = []
                         for element in attribute_value:
                             if isinstance(element, L5xElement):
@@ -48,7 +55,7 @@ class L5xElement:
                             else:
                                 new_child_list.append(f"<{element}/>")
                         child_list.append(
-                            f'<{attribute.title().replace("_", "")}>{"".join(new_child_list)}</{attribute.title().replace("_", "")}>'
+                            f'<{section_name}>{"".join(new_child_list)}</{section_name}>'
                         )
 
                 else:
@@ -58,7 +65,9 @@ class L5xElement:
                         f'{attribute.title().replace("_", "")}="{attribute_value}"'
                     )
 
-        _export_name = self.__class__.__name__.title().replace("_", "")
+        _export_name = (
+            getattr(self, "_export_name", "") or self.__class__.__name__.title().replace("_", "")
+        )
         return f'<{_export_name} {" ".join(attribute_list)}>{"".join(child_list)}</{_export_name}>'
 
 
@@ -78,6 +87,10 @@ class DataType(L5xElement):
     family: str
     cls: str
     members: List[Member]
+
+    def __post_init__(self):
+        super().__post_init__()
+        self._export_name = "DataType"
 
 
 @dataclass
@@ -112,12 +125,18 @@ class Routine(L5xElement):
 
 @dataclass
 class AOI(L5xElement):
+    name: str
     routines: List[Routine]
     tags: List[Tag]
+
+    def __post_init__(self):
+        super().__post_init__()
+        self._export_name = "AddOnInstructionDefinition"
 
 
 @dataclass
 class Program(L5xElement):
+    name: str
     routines: List[Routine]
     tags: List[Tag]
 
@@ -152,7 +171,8 @@ class RSLogix5000Content(L5xElement):
     export_options: str
 
     def __post_init__(self):
-        self._name = "RSLogix5000Content"
+        super().__post_init__()
+        self._export_name = "RSLogix5000Content"
 
 
 def radix_enum(i: int) -> str:
@@ -493,7 +513,7 @@ class AoiBuilder(L5xElementBuilder):
         if len(collection_results) != 0:
             collection_id = collection_results[0][1]
         else:
-            return AOI(name, routines, tags)
+            return AOI(name, name, routines, tags)
 
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record FROM comps WHERE parent_id="
@@ -523,7 +543,7 @@ class AoiBuilder(L5xElementBuilder):
         for result in results:
             tags.append(TagBuilder(self._cur, result[1]).build())
 
-        return AOI(name, routines, tags)
+        return AOI(name, name, routines, tags)
 
 
 @dataclass
@@ -582,7 +602,7 @@ class ProgramBuilder(L5xElementBuilder):
         )
         comment_results = self._cur.fetchall()
 
-        return Program(name, routines, tags)
+        return Program(name, name, routines, tags)
 
 
 @dataclass
@@ -653,7 +673,9 @@ class ControllerBuilder(L5xElementBuilder):
         data_types: List[DataType] = []
         for result in results:
             _data_type_object_id = result[1]
-            data_types.append(DataTypeBuilder(self._cur, _data_type_object_id).build())
+            dt = DataTypeBuilder(self._cur, _data_type_object_id).build()
+            if dt.cls == "User":
+                data_types.append(dt)
 
         # Get the Controller Scoped Tags
         self._cur.execute(
@@ -673,7 +695,9 @@ class ControllerBuilder(L5xElementBuilder):
         tags: List[Tag] = []
         for result in results:
             _tag_object_id = result[1]
-            tags.append(TagBuilder(self._cur, _tag_object_id).build())
+            tag = TagBuilder(self._cur, _tag_object_id).build()
+            if tag.data_type and not tag.name.startswith("$"):
+                tags.append(tag)
 
         # Get the Program Collection and get the programs
         self._cur.execute(
