@@ -65,6 +65,8 @@ class L5xElement:
                 else:
                     if attribute == "cls":
                         attribute = "class"
+                    if isinstance(attribute_value, bool):
+                        attribute_value = str(attribute_value).lower()
                     attribute_list.append(
                         f'{attribute.title().replace("_", "")}="{attribute_value}"'
                     )
