@@ -107,6 +107,7 @@ class Routine(L5xElement):
     name: str
     type: str
     rungs: List[str]
+    _rung_ids: List[int] = field(default_factory=list)
 
 
 @dataclass
@@ -463,8 +464,10 @@ class RoutineBuilder(L5xElementBuilder):
             "LEFT JOIN rungs r ON r.object_id = rm.object_id "
             "WHERE rm.parent_id=" + str(self._object_id) + " ORDER BY rm.seq_no"
         )
-        rungs = [row[1] for row in self._cur.fetchall() if row[1] is not None]
-        return Routine(name, name, routine_type, rungs)
+        rows = [(row[0], row[1]) for row in self._cur.fetchall() if row[1] is not None]
+        rung_ids = [row[0] for row in rows]
+        rungs = [row[1] for row in rows]
+        return Routine(name, name, routine_type, rungs, rung_ids)
 
 
 @dataclass

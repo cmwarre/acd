@@ -100,8 +100,10 @@ class ExportL5x:
         self._cur.executemany("INSERT INTO comps VALUES (?,?,?,?,?,?)", comps_by_id.values())
         self._db.commit()
 
-        # Build name lookup for SbRegion tag reference resolution (object_id → comp_name)
+        # Build name lookup for SbRegion tag reference resolution (object_id → comp_name).
+        # Store on self for use during write-back (patch_sbregion_dat needs id_to_name).
         name_lookup = {oid: t[2] for oid, t in comps_by_id.items()}
+        self._id_to_name: Dict[int, str] = name_lookup
 
         log.info(
             "Getting records from ACD Region Map file and storing in sqllite database"
@@ -157,6 +159,7 @@ class ExportL5x:
             self._project._raw_files = self._raw_files
             self._project._file_order = self._file_order
             self._project._footer_unknown = self._footer_unknown
+            self._project._id_to_name = self._id_to_name
         return self._project
 
     def populate_region_map(self):
