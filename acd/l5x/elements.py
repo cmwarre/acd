@@ -964,7 +964,7 @@ class ControllerBuilder(L5xElementBuilder):
         for result in results:
             _tag_object_id = result[1]
             tag = TagBuilder(self._cur, _tag_object_id).build()
-            if tag.data_type and not tag.name.startswith("$"):
+            if tag.data_type and not tag.name.startswith("$") and ":" not in tag.name and not tag.name.startswith("__"):
                 tags.append(tag)
 
         # Get the Program Collection and get the programs
