@@ -41,11 +41,18 @@ class L5xElement:
         attribute_list: List[str] = []
         child_list: List[str] = []
 
-        # Emit _name as Name="..." attribute for all elements that have a meaningful name
-        # (RSLogix5000Content sets _name to the class name itself to preserve tag casing —
-        # in that case we skip it because it's not a project-object name)
+        # Emit _name as Name="..." for elements that don't already have a public 'name'
+        # field (Tag, DataType, Member, Routine all declare name as a public dataclass
+        # field and will emit it via the normal attribute loop — emitting it here too
+        # would produce a duplicate attribute and invalid XML).
+        # RSLogix5000Content sets _name equal to the class name as a sentinel; skip that too.
         class_name = type(self).__name__
-        if hasattr(self, "_name") and self._name and self._name != class_name:
+        if (
+            hasattr(self, "_name")
+            and self._name
+            and self._name != class_name
+            and "name" not in self.__dict__
+        ):
             attribute_list.append(f'Name="{self._name}"')
 
         for attribute in self.__dict__:
@@ -58,6 +65,12 @@ class L5xElement:
                         new_child_list: List[str] = []
                         for element in attribute_value:
                             if isinstance(element, L5xElement):
+                                # Skip elements marked for L5X exclusion (e.g. ProductDefined
+                                # data types, tags with corrupt/hex-placeholder names).
+                                # This keeps the in-memory model intact while cleaning up
+                                # the XML output — avoids breaking existing API consumers.
+                                if getattr(element, "_l5x_exclude", False):
+                                    continue
                                 new_child_list.append(element.to_xml())
                             else:
                                 new_child_list.append(f"<{element}/>")
@@ -95,6 +108,11 @@ class DataType(L5xElement):
     cls: str
     members: List[Member]
 
+    @property
+    def _l5x_exclude(self) -> bool:
+        """Exclude ProductDefined (firmware built-in) types from L5X export."""
+        return self.cls == "ProductDefined"
+
 
 @dataclass
 class Tag(L5xElement):
@@ -105,6 +123,11 @@ class Tag(L5xElement):
     external_access: str
     _data_table_instance: int
     _comments: List[Tuple[str, str]]
+
+    @property
+    def _l5x_exclude(self) -> bool:
+        """Exclude tags with empty or non-identifier names (hex-address placeholders, etc.)."""
+        return not self.name or not (self.name[0].isalpha() or self.name[0] == "_")
 
 
 @dataclass
@@ -561,9 +584,7 @@ class AoiBuilder(L5xElementBuilder):
         results = self._cur.fetchall()
 
         for result in results:
-            tag = TagBuilder(self._cur, result[1]).build()
-            if tag.name and (tag.name[0].isalpha() or tag.name[0] == "_"):
-                tags.append(tag)
+            tags.append(TagBuilder(self._cur, result[1]).build())
 
         return AOI(name, routines, tags)
 
@@ -616,9 +637,7 @@ class ProgramBuilder(L5xElementBuilder):
         results = self._cur.fetchall()
         tags: List[Tag] = []
         for result in results:
-            tag = TagBuilder(self._cur, result[1]).build()
-            if tag.name and (tag.name[0].isalpha() or tag.name[0] == "_"):
-                tags.append(tag)
+            tags.append(TagBuilder(self._cur, result[1]).build())
 
         self._cur.execute(
             "SELECT tag_reference, record_string FROM comments WHERE parent="
@@ -702,11 +721,7 @@ class ControllerBuilder(L5xElementBuilder):
         data_types: List[DataType] = []
         for result in results:
             _data_type_object_id = result[1]
-            dt = DataTypeBuilder(self._cur, _data_type_object_id).build()
-            # Exclude built-in (ProductDefined) types — these are part of the firmware and
-            # should not appear in a user-exported L5X file (#23)
-            if dt.cls != "ProductDefined":
-                data_types.append(dt)
+            data_types.append(DataTypeBuilder(self._cur, _data_type_object_id).build())
 
         # Get the Controller Scoped Tags
         self._cur.execute(
@@ -726,10 +741,7 @@ class ControllerBuilder(L5xElementBuilder):
         tags: List[Tag] = []
         for result in results:
             _tag_object_id = result[1]
-            tag = TagBuilder(self._cur, _tag_object_id).build()
-            # Skip tags with empty or invalid names (hex-address placeholders, etc.) (#24)
-            if tag.name and (tag.name[0].isalpha() or tag.name[0] == "_"):
-                tags.append(tag)
+            tags.append(TagBuilder(self._cur, _tag_object_id).build())
 
         # Get the Program Collection and get the programs
         self._cur.execute(
