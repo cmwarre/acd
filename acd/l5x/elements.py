@@ -7,9 +7,21 @@ from datetime import datetime, timedelta
 from os import PathLike
 from pathlib import Path
 from sqlite3 import Cursor
-from typing import List, Tuple, Dict, Union
+from typing import ClassVar, List, Tuple, Dict, Union
 
 from acd.generated.comps.rx_generic import RxGeneric
+
+# Maps Python attribute names to their L5X XML collection element names.
+# Explicit mapping avoids title()-based casing bugs (e.g. "Datatypes" vs "DataTypes")
+# and handles non-obvious names like aois -> AddOnInstructionDefinitions.
+_XML_COLLECTION_NAMES: Dict[str, str] = {
+    "tags": "Tags",
+    "data_types": "DataTypes",
+    "members": "Members",
+    "programs": "Programs",
+    "routines": "Routines",
+    "aois": "AddOnInstructionDefinitions",
+}
 
 
 @dataclass
@@ -25,32 +37,34 @@ class L5xElement:
     def __post_init__(self):
         self._export_name = ""
 
-    def to_xml(self):
+    def to_xml(self) -> str:
         attribute_list: List[str] = []
         child_list: List[str] = []
+
+        # Emit _name as Name="..." attribute for all elements that have a meaningful name
+        # (RSLogix5000Content sets _name to the class name itself to preserve tag casing —
+        # in that case we skip it because it's not a project-object name)
+        class_name = type(self).__name__
+        if hasattr(self, "_name") and self._name and self._name != class_name:
+            attribute_list.append(f'Name="{self._name}"')
+
         for attribute in self.__dict__:
             if attribute[0] != "_":
                 attribute_value = self.__getattribute__(attribute)
                 if isinstance(attribute_value, L5xElement):
                     child_list.append(attribute_value.to_xml())
                 elif isinstance(attribute_value, list):
-                    if (
-                        attribute == "tags"
-                        or attribute == "data_types"
-                        or attribute == "members"
-                        or attribute == "programs"
-                        or attribute == "routines"
-                    ):
+                    if attribute in _XML_COLLECTION_NAMES:
                         new_child_list: List[str] = []
                         for element in attribute_value:
                             if isinstance(element, L5xElement):
                                 new_child_list.append(element.to_xml())
                             else:
                                 new_child_list.append(f"<{element}/>")
+                        coll_name = _XML_COLLECTION_NAMES[attribute]
                         child_list.append(
-                            f'<{attribute.title().replace("_", "")}>{"".join(new_child_list)}</{attribute.title().replace("_", "")}>'
+                            f'<{coll_name}>{"".join(new_child_list)}</{coll_name}>'
                         )
-
                 else:
                     if attribute == "cls":
                         attribute = "class"
@@ -58,8 +72,10 @@ class L5xElement:
                         f'{attribute.title().replace("_", "")}="{attribute_value}"'
                     )
 
-        _export_name = self.__class__.__name__.title().replace("_", "")
-        return f'<{_export_name} {" ".join(attribute_list)}>{"".join(child_list)}</{_export_name}>'
+        # Use _xml_element_name class variable if defined (e.g. AOI -> AddOnInstructionDefinition)
+        # otherwise fall back to the Python class name directly (no .title() — preserves casing)
+        export_name = getattr(type(self), "_xml_element_name", class_name)
+        return f'<{export_name} {" ".join(attribute_list)}>{"".join(child_list)}</{export_name}>'
 
 
 @dataclass
@@ -111,6 +127,7 @@ class Routine(L5xElement):
 
 @dataclass
 class AOI(L5xElement):
+    _xml_element_name: ClassVar[str] = "AddOnInstructionDefinition"
     routines: List[Routine]
     tags: List[Tag]
 
@@ -135,6 +152,20 @@ class Controller(L5xElement):
     programs: List[Program]
     aois: List[AOI]
     map_devices: List[MapDevice]
+
+    def to_xml(self) -> str:
+        base = super().to_xml()
+        # Inject L5X-required stub sections that the generic model doesn't carry.
+        # Without these, Studio 5000 may reject the file as structurally incomplete.
+        stubs = (
+            '<RedundancyInfo Enabled="false" KeepTestEditsOnSwitchOver="false" '
+            'IOMemoryPadPercentage="90" DataTablePadPercentage="50"/>'
+            '<Security Code="0" ChangesToDetect="16#ffff_ffff"/>'
+            '<SafetyInfo/>'
+            '<Tasks/>'
+        )
+        closing = "</Controller>"
+        return base[: -len(closing)] + stubs + closing
 
 
 @dataclass
@@ -530,7 +561,9 @@ class AoiBuilder(L5xElementBuilder):
         results = self._cur.fetchall()
 
         for result in results:
-            tags.append(TagBuilder(self._cur, result[1]).build())
+            tag = TagBuilder(self._cur, result[1]).build()
+            if tag.name and (tag.name[0].isalpha() or tag.name[0] == "_"):
+                tags.append(tag)
 
         return AOI(name, routines, tags)
 
@@ -583,7 +616,9 @@ class ProgramBuilder(L5xElementBuilder):
         results = self._cur.fetchall()
         tags: List[Tag] = []
         for result in results:
-            tags.append(TagBuilder(self._cur, result[1]).build())
+            tag = TagBuilder(self._cur, result[1]).build()
+            if tag.name and (tag.name[0].isalpha() or tag.name[0] == "_"):
+                tags.append(tag)
 
         self._cur.execute(
             "SELECT tag_reference, record_string FROM comments WHERE parent="
@@ -667,7 +702,11 @@ class ControllerBuilder(L5xElementBuilder):
         data_types: List[DataType] = []
         for result in results:
             _data_type_object_id = result[1]
-            data_types.append(DataTypeBuilder(self._cur, _data_type_object_id).build())
+            dt = DataTypeBuilder(self._cur, _data_type_object_id).build()
+            # Exclude built-in (ProductDefined) types — these are part of the firmware and
+            # should not appear in a user-exported L5X file (#23)
+            if dt.cls != "ProductDefined":
+                data_types.append(dt)
 
         # Get the Controller Scoped Tags
         self._cur.execute(
@@ -687,7 +726,10 @@ class ControllerBuilder(L5xElementBuilder):
         tags: List[Tag] = []
         for result in results:
             _tag_object_id = result[1]
-            tags.append(TagBuilder(self._cur, _tag_object_id).build())
+            tag = TagBuilder(self._cur, _tag_object_id).build()
+            # Skip tags with empty or invalid names (hex-address placeholders, etc.) (#24)
+            if tag.name and (tag.name[0].isalpha() or tag.name[0] == "_"):
+                tags.append(tag)
 
         # Get the Program Collection and get the programs
         self._cur.execute(
