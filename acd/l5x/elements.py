@@ -7,9 +7,21 @@ from datetime import datetime, timedelta
 from os import PathLike
 from pathlib import Path
 from sqlite3 import Cursor
-from typing import List, Tuple, Dict, Union
+from typing import ClassVar, List, Tuple, Dict, Union
 
 from acd.generated.comps.rx_generic import RxGeneric
+
+# Maps Python attribute names to their L5X XML collection element names.
+# Explicit mapping avoids title()-based casing bugs (e.g. "Datatypes" vs "DataTypes")
+# and handles non-obvious names like aois -> AddOnInstructionDefinitions.
+_XML_COLLECTION_NAMES: Dict[str, str] = {
+    "tags": "Tags",
+    "data_types": "DataTypes",
+    "members": "Members",
+    "programs": "Programs",
+    "routines": "Routines",
+    "aois": "AddOnInstructionDefinitions",
+}
 
 
 @dataclass
@@ -25,32 +37,47 @@ class L5xElement:
     def __post_init__(self):
         self._export_name = ""
 
-    def to_xml(self):
+    def to_xml(self) -> str:
         attribute_list: List[str] = []
         child_list: List[str] = []
+
+        # Emit _name as Name="..." for elements that don't already have a public 'name'
+        # field (Tag, DataType, Member, Routine all declare name as a public dataclass
+        # field and will emit it via the normal attribute loop — emitting it here too
+        # would produce a duplicate attribute and invalid XML).
+        # RSLogix5000Content sets _name equal to the class name as a sentinel; skip that too.
+        class_name = type(self).__name__
+        if (
+            hasattr(self, "_name")
+            and self._name
+            and self._name != class_name
+            and "name" not in self.__dict__
+        ):
+            attribute_list.append(f'Name="{self._name}"')
+
         for attribute in self.__dict__:
             if attribute[0] != "_":
                 attribute_value = self.__getattribute__(attribute)
                 if isinstance(attribute_value, L5xElement):
                     child_list.append(attribute_value.to_xml())
                 elif isinstance(attribute_value, list):
-                    if (
-                        attribute == "tags"
-                        or attribute == "data_types"
-                        or attribute == "members"
-                        or attribute == "programs"
-                        or attribute == "routines"
-                    ):
+                    if attribute in _XML_COLLECTION_NAMES:
                         new_child_list: List[str] = []
                         for element in attribute_value:
                             if isinstance(element, L5xElement):
+                                # Skip elements marked for L5X exclusion (e.g. ProductDefined
+                                # data types, tags with corrupt/hex-placeholder names).
+                                # This keeps the in-memory model intact while cleaning up
+                                # the XML output — avoids breaking existing API consumers.
+                                if getattr(element, "_l5x_exclude", False):
+                                    continue
                                 new_child_list.append(element.to_xml())
                             else:
                                 new_child_list.append(f"<{element}/>")
+                        coll_name = _XML_COLLECTION_NAMES[attribute]
                         child_list.append(
-                            f'<{attribute.title().replace("_", "")}>{"".join(new_child_list)}</{attribute.title().replace("_", "")}>'
+                            f'<{coll_name}>{"".join(new_child_list)}</{coll_name}>'
                         )
-
                 else:
                     if attribute == "cls":
                         attribute = "class"
@@ -58,8 +85,10 @@ class L5xElement:
                         f'{attribute.title().replace("_", "")}="{attribute_value}"'
                     )
 
-        _export_name = self.__class__.__name__.title().replace("_", "")
-        return f'<{_export_name} {" ".join(attribute_list)}>{"".join(child_list)}</{_export_name}>'
+        # Use _xml_element_name class variable if defined (e.g. AOI -> AddOnInstructionDefinition)
+        # otherwise fall back to the Python class name directly (no .title() — preserves casing)
+        export_name = getattr(type(self), "_xml_element_name", class_name)
+        return f'<{export_name} {" ".join(attribute_list)}>{"".join(child_list)}</{export_name}>'
 
 
 @dataclass
@@ -79,6 +108,11 @@ class DataType(L5xElement):
     cls: str
     members: List[Member]
 
+    @property
+    def _l5x_exclude(self) -> bool:
+        """Exclude ProductDefined (firmware built-in) types from L5X export."""
+        return self.cls == "ProductDefined"
+
 
 @dataclass
 class Tag(L5xElement):
@@ -89,6 +123,11 @@ class Tag(L5xElement):
     external_access: str
     _data_table_instance: int
     _comments: List[Tuple[str, str]]
+
+    @property
+    def _l5x_exclude(self) -> bool:
+        """Exclude tags with empty or non-identifier names (hex-address placeholders, etc.)."""
+        return not self.name or not (self.name[0].isalpha() or self.name[0] == "_")
 
 
 @dataclass
@@ -111,6 +150,7 @@ class Routine(L5xElement):
 
 @dataclass
 class AOI(L5xElement):
+    _xml_element_name: ClassVar[str] = "AddOnInstructionDefinition"
     routines: List[Routine]
     tags: List[Tag]
 
@@ -135,6 +175,20 @@ class Controller(L5xElement):
     programs: List[Program]
     aois: List[AOI]
     map_devices: List[MapDevice]
+
+    def to_xml(self) -> str:
+        base = super().to_xml()
+        # Inject L5X-required stub sections that the generic model doesn't carry.
+        # Without these, Studio 5000 may reject the file as structurally incomplete.
+        stubs = (
+            '<RedundancyInfo Enabled="false" KeepTestEditsOnSwitchOver="false" '
+            'IOMemoryPadPercentage="90" DataTablePadPercentage="50"/>'
+            '<Security Code="0" ChangesToDetect="16#ffff_ffff"/>'
+            '<SafetyInfo/>'
+            '<Tasks/>'
+        )
+        closing = "</Controller>"
+        return base[: -len(closing)] + stubs + closing
 
 
 @dataclass
