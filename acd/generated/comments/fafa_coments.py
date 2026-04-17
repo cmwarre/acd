@@ -74,7 +74,7 @@ class FafaComents(KaitaiStruct):
             self.unknown_3 = self._io.read_bytes(12)
             self.record_string = (
                 self._io.read_bytes_term(0, False, True, True)
-            ).decode("UTF-8")
+            ).decode("UTF-8", errors="replace")
 
     class AsciiRecord(KaitaiStruct):
         def __init__(self, _io, _parent=None, _root=None):
@@ -89,7 +89,7 @@ class FafaComents(KaitaiStruct):
             self.unknown_2 = self._io.read_bytes(13)
             self.record_string = (
                 self._io.read_bytes_term(0, False, True, True)
-            ).decode("UTF-8")
+            ).decode("UTF-8", errors="replace")
 
     class AsciiRecord4(KaitaiStruct):
         def __init__(self, _io, _parent=None, _root=None):
@@ -104,7 +104,7 @@ class FafaComents(KaitaiStruct):
             self.unknown_2 = self._io.read_bytes(24)
             self.record_string = (
                 self._io.read_bytes_term(0, False, True, True)
-            ).decode("UTF-8")
+            ).decode("UTF-8", errors="replace")
 
     class Header(KaitaiStruct):
         def __init__(self, _io, _parent=None, _root=None):
@@ -212,7 +212,7 @@ class FafaComents(KaitaiStruct):
             self.unknown_3 = self._io.read_bytes(self.len_unknown_3)
             self.record_string = (
                 self._io.read_bytes_term(0, False, True, True)
-            ).decode("UTF-8")
+            ).decode("UTF-8", errors="replace")
 
     @property
     def lookup_id(self):

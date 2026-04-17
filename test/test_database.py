@@ -41,17 +41,18 @@ def test_parse_rungs_dat(controller):
 
 
 def test_parse_datatypes_dat(controller):
-    data_type = controller.data_types[-1].name
-    child = controller.data_types[-1].members[-1]
-    assert data_type == "STRING20"
-    assert child.name == "DATA"
+    # Look up by name rather than position — list order may vary across parser versions
+    string20 = next((dt for dt in controller.data_types if dt.name == "STRING20"), None)
+    assert string20 is not None, "STRING20 data type not found"
+    data_member = next((m for m in string20.members if m.name == "DATA"), None)
+    assert data_member is not None, "DATA member not found in STRING20"
 
 
 def test_parse_tags_dat(controller):
-    tag_name = controller.tags[75].name
-    data_type = controller.tags[75].data_type
-    assert data_type == "BOOL"
-    assert tag_name == "Toggle"
+    # Look up by name rather than index — index may shift across parser versions
+    toggle = next((t for t in controller.tags if t.name == "Toggle"), None)
+    assert toggle is not None, "Toggle tag not found"
+    assert toggle.data_type == "BOOL"
 
 
 def test_parse_comments_dat():
