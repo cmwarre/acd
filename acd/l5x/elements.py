@@ -7,27 +7,29 @@ from datetime import datetime, timedelta
 from os import PathLike
 from pathlib import Path
 from sqlite3 import Cursor
-from typing import ClassVar, List, Tuple, Dict, Union
+from typing import List, Tuple, Dict, Union
 
 from acd.generated.comps.rx_generic import RxGeneric
-
-# Maps Python attribute names to their L5X XML collection element names.
-# Explicit mapping avoids title()-based casing bugs (e.g. "Datatypes" vs "DataTypes")
-# and handles non-obvious names like aois -> AddOnInstructionDefinitions.
-_XML_COLLECTION_NAMES: Dict[str, str] = {
-    "tags": "Tags",
-    "data_types": "DataTypes",
-    "members": "Members",
-    "programs": "Programs",
-    "routines": "Routines",
-    "aois": "AddOnInstructionDefinitions",
-}
 
 
 @dataclass
 class L5xElementBuilder:
     _cur: Cursor
     _object_id: int = -1
+
+
+# Maps Python attribute names to L5X XML section wrapper tag names.
+# Entries here also control which list attributes are serialized as child sections.
+_LIST_SECTION_NAMES = {
+    "tags": "Tags",
+    "data_types": "DataTypes",
+    "members": "Members",
+    "programs": "Programs",
+    "routines": "Routines",
+    "aois": "AddOnInstructionDefinitions",
+    "tasks": "Tasks",
+    "scheduled_programs": "ScheduledPrograms",
+}
 
 
 @dataclass
@@ -40,55 +42,42 @@ class L5xElement:
     def to_xml(self) -> str:
         attribute_list: List[str] = []
         child_list: List[str] = []
-
-        # Emit _name as Name="..." for elements that don't already have a public 'name'
-        # field (Tag, DataType, Member, Routine all declare name as a public dataclass
-        # field and will emit it via the normal attribute loop — emitting it here too
-        # would produce a duplicate attribute and invalid XML).
-        # RSLogix5000Content sets _name equal to the class name as a sentinel; skip that too.
-        class_name = type(self).__name__
-        if (
-            hasattr(self, "_name")
-            and self._name
-            and self._name != class_name
-            and "name" not in self.__dict__
-        ):
-            attribute_list.append(f'Name="{self._name}"')
-
         for attribute in self.__dict__:
             if attribute[0] != "_":
                 attribute_value = self.__getattribute__(attribute)
+                if attribute_value is None:
+                    continue
                 if isinstance(attribute_value, L5xElement):
                     child_list.append(attribute_value.to_xml())
                 elif isinstance(attribute_value, list):
-                    if attribute in _XML_COLLECTION_NAMES:
+                    if attribute in _LIST_SECTION_NAMES:
+                        section_name = _LIST_SECTION_NAMES[attribute]
                         new_child_list: List[str] = []
                         for element in attribute_value:
                             if isinstance(element, L5xElement):
-                                # Skip elements marked for L5X exclusion (e.g. ProductDefined
-                                # data types, tags with corrupt/hex-placeholder names).
-                                # This keeps the in-memory model intact while cleaning up
-                                # the XML output — avoids breaking existing API consumers.
                                 if getattr(element, "_l5x_exclude", False):
                                     continue
                                 new_child_list.append(element.to_xml())
                             else:
                                 new_child_list.append(f"<{element}/>")
-                        coll_name = _XML_COLLECTION_NAMES[attribute]
                         child_list.append(
-                            f'<{coll_name}>{"".join(new_child_list)}</{coll_name}>'
+                            f'<{section_name}>{"".join(new_child_list)}</{section_name}>'
                         )
                 else:
                     if attribute == "cls":
                         attribute = "class"
+                    if isinstance(attribute_value, bool):
+                        attribute_value = str(attribute_value).lower()
+                    _overrides = getattr(self, "_xml_attr_overrides", {})
+                    xml_attr_name = _overrides.get(attribute, attribute.title().replace("_", ""))
                     attribute_list.append(
-                        f'{attribute.title().replace("_", "")}="{attribute_value}"'
+                        f'{xml_attr_name}="{attribute_value}"'
                     )
 
-        # Use _xml_element_name class variable if defined (e.g. AOI -> AddOnInstructionDefinition)
-        # otherwise fall back to the Python class name directly (no .title() — preserves casing)
-        export_name = getattr(type(self), "_xml_element_name", class_name)
-        return f'<{export_name} {" ".join(attribute_list)}>{"".join(child_list)}</{export_name}>'
+        _export_name = (
+            getattr(self, "_export_name", "") or self.__class__.__name__.title().replace("_", "")
+        )
+        return f'<{_export_name} {" ".join(attribute_list)}>{"".join(child_list)}</{_export_name}>'
 
 
 @dataclass
@@ -108,9 +97,12 @@ class DataType(L5xElement):
     cls: str
     members: List[Member]
 
+    def __post_init__(self):
+        super().__post_init__()
+        self._export_name = "DataType"
+
     @property
     def _l5x_exclude(self) -> bool:
-        """Exclude ProductDefined (firmware built-in) types from L5X export."""
         return self.cls == "ProductDefined"
 
 
@@ -146,46 +138,124 @@ class Routine(L5xElement):
     name: str
     type: str
     rungs: List[str]
+    _rung_ids: List[int] = field(default_factory=list)
 
 
 @dataclass
 class AOI(L5xElement):
-    _xml_element_name: ClassVar[str] = "AddOnInstructionDefinition"
+    name: str
+    revision: str
+    revision_extension: Union[str, None]  # None if absent (omitted from XML)
+    vendor: Union[str, None]  # None if absent (omitted from XML)
+    execute_prescan: str
+    execute_postscan: str
+    execute_enable_in_false: str
+    created_date: str
+    created_by: str
+    edited_date: str
+    edited_by: str
+    software_revision: str
     routines: List[Routine]
     tags: List[Tag]
+
+    def __post_init__(self):
+        super().__post_init__()
+        self._export_name = "AddOnInstructionDefinition"
 
 
 @dataclass
 class Program(L5xElement):
+    name: str
+    test_edits: str
+    main_routine_name: Union[str, None]  # None if absent (omitted from XML)
+    fault_routine_name: Union[str, None]  # None if absent (omitted from XML)
+    disabled: str
+    use_as_folder: str
     routines: List[Routine]
     tags: List[Tag]
 
 
 @dataclass
+class ScheduledProgram(L5xElement):
+    name: str
+
+    def __post_init__(self):
+        super().__post_init__()
+        self._export_name = "ScheduledProgram"
+
+
+@dataclass
+class EventInfo(L5xElement):
+    event_trigger: str
+    enable_timeout: str
+
+    def __post_init__(self):
+        super().__post_init__()
+        self._export_name = "EventInfo"
+
+
+@dataclass
+class Task(L5xElement):
+    name: str
+    type: str
+    rate: Union[str, None]  # None for CONTINUOUS tasks (omitted from XML)
+    priority: str
+    watchdog: str
+    disable_update_outputs: str
+    inhibit_task: str
+    event_info: Union[EventInfo, None]  # None for non-EVENT tasks
+    scheduled_programs: List[ScheduledProgram]
+
+
+@dataclass
 class Controller(L5xElement):
-    serial_number: str
-    comm_path: str
+    use: str
+    name: str
+    processor_type: Union[str, None]  # None if unknown (omitted from XML)
+    major_rev: str
+    minor_rev: str
+    major_fault_program: Union[str, None]  # None if not set (omitted from XML)
+    project_creation_date: str
+    last_modified_date: str
     sfc_execution_control: str
     sfc_restart_position: str
     sfc_last_scan: str
-    created_date: str
-    modified_date: str
+    project_sn: str
+    match_project_to_controller: str
+    can_use_rpi_from_producer: str
+    inhibit_automatic_firmware_update: str
+    pass_through_configuration: str
+    download_project_documentation_and_extended_properties: str
+    download_project_custom_properties: str
+    report_minor_overflow: str
+    auto_diags_enabled: str
+    web_server_enabled: str
     data_types: List[DataType]
     tags: List[Tag]
     programs: List[Program]
+    tasks: List[Task]
     aois: List[AOI]
     map_devices: List[MapDevice]
 
+    def __post_init__(self):
+        super().__post_init__()
+        self._xml_attr_overrides = {
+            "sfc_execution_control": "SFCExecutionControl",
+            "sfc_restart_position": "SFCRestartPosition",
+            "sfc_last_scan": "SFCLastScan",
+            "project_sn": "ProjectSN",
+            "can_use_rpi_from_producer": "CanUseRPIFromProducer",
+        }
+
     def to_xml(self) -> str:
         base = super().to_xml()
-        # Inject L5X-required stub sections that the generic model doesn't carry.
-        # Without these, Studio 5000 may reject the file as structurally incomplete.
+        # Studio 5000 rejects the L5X without these structural sections. Tasks is
+        # omitted because we serialise real tasks via the collection loop.
         stubs = (
             '<RedundancyInfo Enabled="false" KeepTestEditsOnSwitchOver="false" '
             'IOMemoryPadPercentage="90" DataTablePadPercentage="50"/>'
             '<Security Code="0" ChangesToDetect="16#ffff_ffff"/>'
             '<SafetyInfo/>'
-            '<Tasks/>'
         )
         closing = "</Controller>"
         return base[: -len(closing)] + stubs + closing
@@ -205,7 +275,8 @@ class RSLogix5000Content(L5xElement):
     export_options: str
 
     def __post_init__(self):
-        self._name = "RSLogix5000Content"
+        super().__post_init__()
+        self._export_name = "RSLogix5000Content"
 
 
 def radix_enum(i: int) -> str:
@@ -321,7 +392,7 @@ class DataTypeBuilder(L5xElementBuilder):
         class_type = "User"
         if module_defined > 0:
             class_type = "IO"
-        if built_in > 0:
+        if built_in & 0x03:
             class_type = "ProductDefined"
         if 0x64 in extended_records and len(extended_records[0x64]) == 0x04:
             member_count = struct.unpack("<I", extended_records[0x64])[0]
@@ -529,8 +600,79 @@ class RoutineBuilder(L5xElementBuilder):
             "LEFT JOIN rungs r ON r.object_id = rm.object_id "
             "WHERE rm.parent_id=" + str(self._object_id) + " ORDER BY rm.seq_no"
         )
-        rungs = [row[1] for row in self._cur.fetchall() if row[1] is not None]
-        return Routine(name, name, routine_type, rungs)
+        rows = [(row[0], row[1]) for row in self._cur.fetchall() if row[1] is not None]
+        rung_ids = [row[0] for row in rows]
+        rungs = [row[1] for row in rows]
+        return Routine(name, name, routine_type, rungs, rung_ids)
+
+
+def _parse_fffeff(data: bytes, offset: int):
+    """Parse one fffeff-encoded string at offset. Returns (str, new_offset)."""
+    if offset + 3 > len(data) or not (data[offset] == 0xFF and data[offset+1] == 0xFE and data[offset+2] == 0xFF):
+        return "", offset
+    length = data[offset+3]
+    s = data[offset+4:offset+4+length*2].decode("utf-16-le", errors="replace")
+    return s, offset + 4 + length * 2
+
+
+def _parse_aoi_nameless(data: bytes) -> dict:
+    """Extract AOI metadata from its large nameless record."""
+    result: dict = {}
+
+    offset = 0x1A
+    # Three empty fffeff strings
+    for _ in range(3):
+        _, offset = _parse_fffeff(data, offset)
+
+    # 8 bytes (unknown - some kind of date, skip)
+    offset += 8
+
+    # 2-byte constant (0x0002 observed)
+    offset += 2
+
+    # CreatedBy
+    result["created_by"], offset = _parse_fffeff(data, offset)
+
+    # Software revision at creation time (skip - we want the current one later)
+    _, offset = _parse_fffeff(data, offset)
+
+    # 4 zero bytes
+    offset += 4
+
+    # Empty fffeff placeholder
+    _, offset = _parse_fffeff(data, offset)
+
+    # CreatedDate FILETIME (8 bytes, Windows FILETIME in 100-ns units)
+    ft = struct.unpack_from("<Q", data, offset)[0]
+    if ft:
+        dt = datetime(1601, 1, 1) + timedelta(microseconds=ft // 10)
+        result["created_date"] = dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+    else:
+        result["created_date"] = ""
+    offset += 8
+
+    # EditedBy
+    result["edited_by"], offset = _parse_fffeff(data, offset)
+
+    # SoftwareRevision (current)
+    result["software_revision"], offset = _parse_fffeff(data, offset)
+
+    # 4 bytes (01 00 00 00)
+    offset += 4
+
+    # RevisionExtension
+    rev_ext, offset = _parse_fffeff(data, offset)
+    result["revision_extension"] = rev_ext or None
+
+    # EditedDate FILETIME (always last 8 bytes)
+    ft = struct.unpack_from("<Q", data, len(data) - 8)[0]
+    if ft:
+        dt = datetime(1601, 1, 1) + timedelta(microseconds=ft // 10)
+        result["edited_date"] = dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+    else:
+        result["edited_date"] = ""
+
+    return result
 
 
 @dataclass
@@ -542,8 +684,35 @@ class AoiBuilder(L5xElementBuilder):
         )
         results = self._cur.fetchall()
 
-        record = results[0][3]
+        aoi_record = bytes(results[0][3])
         name = results[0][0]
+
+        # --- Revision (major.minor) from ext[0x01] ---
+        try:
+            r = RxGeneric.from_bytes(aoi_record)
+            exts: Dict[int, bytes] = {e.attribute_id: bytes(e.value) for e in r.extended_records}
+            e01 = exts.get(0x01, b"")
+            rev_major = struct.unpack_from("<H", e01, 0x1A)[0] if len(e01) > 0x1B else 1
+            rev_minor = struct.unpack_from("<H", e01, 0x1C)[0] if len(e01) > 0x1D else 0
+        except Exception:
+            rev_major, rev_minor = 1, 0
+        revision = f"{rev_major}.{rev_minor}"
+
+        # --- Vendor from comps record ---
+        vlen = struct.unpack_from("<H", aoi_record, 0xA6)[0] if len(aoi_record) > 0xA8 else 0
+        vendor: Union[str, None] = aoi_record[0xA8:0xA8+vlen].decode("utf-8", errors="replace") if vlen > 0 else None
+
+        # --- Metadata from large nameless record ---
+        self._cur.execute(
+            "SELECT record FROM nameless WHERE parent_id=" + str(self._object_id)
+            + " ORDER BY LENGTH(record) DESC LIMIT 1"
+        )
+        nameless_row = self._cur.fetchone()
+        if nameless_row and len(bytes(nameless_row[0])) > 50:
+            meta = _parse_aoi_nameless(bytes(nameless_row[0]))
+        else:
+            meta = {"created_by": "", "created_date": "", "edited_by": "", "edited_date": "",
+                    "software_revision": "", "revision_extension": None}
 
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record FROM comps WHERE parent_id="
@@ -556,7 +725,11 @@ class AoiBuilder(L5xElementBuilder):
         if len(collection_results) != 0:
             collection_id = collection_results[0][1]
         else:
-            return AOI(name, routines, tags)
+            return AOI(name, name, revision, meta["revision_extension"], vendor,
+                       "false", "false", "false",
+                       meta["created_date"], meta["created_by"],
+                       meta["edited_date"], meta["edited_by"],
+                       meta["software_revision"], routines, tags)
 
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record FROM comps WHERE parent_id="
@@ -567,26 +740,33 @@ class AoiBuilder(L5xElementBuilder):
         for child in routine_results:
             routines.append(RoutineBuilder(self._cur, child[1]).build())
 
-        # Get the Program Scoped Tags
+        # Get the AOI-Scoped Tags
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record_type FROM comps WHERE parent_id="
             + str(self._object_id)
             + " AND comp_name='RxTagCollection'"
         )
-        results = self._cur.fetchall()
-        if len(results) > 1:
-            raise Exception("Contains more than one program tag collection")
+        tag_coll = self._cur.fetchall()
+        if len(tag_coll) > 1:
+            raise Exception("Contains more than one AOI tag collection")
 
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record_type FROM comps WHERE parent_id="
-            + str(results[0][1])
+            + str(tag_coll[0][1])
         )
-        results = self._cur.fetchall()
-
-        for result in results:
+        for result in self._cur.fetchall():
             tags.append(TagBuilder(self._cur, result[1]).build())
 
-        return AOI(name, routines, tags)
+        return AOI(
+            name, name, revision,
+            meta["revision_extension"],
+            vendor,
+            "false", "false", "false",
+            meta["created_date"], meta["created_by"],
+            meta["edited_date"], meta["edited_by"],
+            meta["software_revision"],
+            routines, tags,
+        )
 
 
 @dataclass
@@ -598,9 +778,28 @@ class ProgramBuilder(L5xElementBuilder):
         )
         results = self._cur.fetchall()
 
-        r = RxGeneric.from_bytes(results[0][3])
+        prog_record = bytes(results[0][3])
+        r = RxGeneric.from_bytes(prog_record)
 
         name = results[0][0]
+
+        # --- MainRoutineName and FaultRoutineName from extended records ---
+        # ext[0x12D] = MainRoutine object_id, ext[0x066] = FaultRoutine object_id
+        exts: Dict[int, bytes] = {e.attribute_id: bytes(e.value) for e in r.extended_records}
+        main_routine_name: Union[str, None] = None
+        fault_routine_name: Union[str, None] = None
+        if 0x12D in exts and len(exts[0x12D]) >= 4:
+            main_oid = struct.unpack_from("<I", exts[0x12D], 0)[0]
+            if main_oid:
+                self._cur.execute("SELECT comp_name FROM comps WHERE object_id=" + str(main_oid))
+                row = self._cur.fetchone()
+                main_routine_name = row[0] if row else None
+        if 0x066 in exts and len(exts[0x066]) >= 4:
+            fault_oid = struct.unpack_from("<I", exts[0x066], 0)[0]
+            if fault_oid:
+                self._cur.execute("SELECT comp_name FROM comps WHERE object_id=" + str(fault_oid))
+                row = self._cur.fetchone()
+                fault_routine_name = row[0] if row else None
 
         self._cur.execute(
             "SELECT comp_name, object_id, parent_id, record FROM comps WHERE parent_id="
@@ -645,7 +844,59 @@ class ProgramBuilder(L5xElementBuilder):
         )
         comment_results = self._cur.fetchall()
 
-        return Program(name, routines, tags)
+        return Program(name, name, "false", main_routine_name, fault_routine_name,
+                       "false", "false", routines, tags)
+
+
+_TASK_TYPE_MAP = {1: "EVENT", 2: "PERIODIC", 4: "CONTINUOUS"}
+
+
+@dataclass
+class TaskBuilder(L5xElementBuilder):
+    def build(self, comment_id_to_program: Dict[int, str]) -> Task:
+        self._cur.execute(
+            "SELECT comp_name, record FROM comps WHERE object_id=" + str(self._object_id)
+        )
+        row = self._cur.fetchone()
+        name, record = row[0], row[1]
+
+        # All task config fields live within ext[0x01], accessed via absolute BLOB offsets.
+        # These offsets were reverse-engineered from CIPDemo_RevEng.ACD.
+        rate_us = struct.unpack_from("<I", record, 0x106C)[0]
+        type_val = struct.unpack_from("<H", record, 0x10F6)[0]
+        priority = struct.unpack_from("<H", record, 0x10F8)[0]
+        watchdog_us = struct.unpack_from("<I", record, 0x110A)[0]
+        disable_update = record[0x112E]
+
+        task_type = _TASK_TYPE_MAP.get(type_val, "PERIODIC")
+        rate_str = str(rate_us // 1000) if task_type != "CONTINUOUS" else None
+
+        # Scheduled programs: ext[0x01] value starts at BLOB offset 0x5A.
+        # Format: u16 count followed by N u32 comment_ids.
+        prog_count = struct.unpack_from("<H", record, 0x5A)[0]
+        scheduled_programs = []
+        for i in range(prog_count):
+            cid = struct.unpack_from("<I", record, 0x5A + 2 + i * 4)[0]
+            prog_name = comment_id_to_program.get(cid)
+            if prog_name:
+                scheduled_programs.append(ScheduledProgram(prog_name, prog_name))
+
+        event_info = None
+        if task_type == "EVENT":
+            event_info = EventInfo("EventInfo", "EVENT Instruction Only", "false")
+
+        return Task(
+            name,
+            name,
+            task_type,
+            rate_str,
+            str(priority),
+            str(watchdog_us // 1000),
+            "true" if disable_update else "false",
+            "false",
+            event_info,
+            scheduled_programs,
+        )
 
 
 @dataclass
@@ -677,26 +928,39 @@ class ControllerBuilder(L5xElementBuilder):
                 return ""
             return bytes(raw[:-2]).decode("utf-16", errors="replace")
 
-        comm_path = _decode_utf16(0x6A)
         sfc_execution_control = _decode_utf16(0x6F)
         sfc_restart_position = _decode_utf16(0x70)
         sfc_last_scan = _decode_utf16(0x71)
 
         if 0x75 in extended_records:
-            serial_number_raw = hex(struct.unpack("<I", extended_records[0x75])[0])[2:].zfill(8)
-            serial_number = f"16#{serial_number_raw[:4].upper()}_{serial_number_raw[4:].upper()}"
+            sn_raw = hex(struct.unpack("<I", extended_records[0x75])[0])[2:].zfill(8)
+            project_sn = f"16#{sn_raw[:4].upper()}_{sn_raw[4:].upper()}"
         else:
-            serial_number = "Unknown"
+            project_sn = "Unknown"
 
         raw_modified_date = struct.unpack("<Q", extended_records[0x66])[0] / 10000000
-        epoch_modified_date = datetime(1601, 1, 1) + timedelta(
-            seconds=raw_modified_date
-        )
-        modified_date = epoch_modified_date.strftime("%a %b %d %H:%M:%S %Y")
+        last_modified_date = (
+            datetime(1601, 1, 1) + timedelta(seconds=raw_modified_date)
+        ).strftime("%a %b %d %H:%M:%S %Y")
 
         raw_created_date = struct.unpack("<Q", extended_records[0x65])[0] / 10000000
-        epoch_created_date = datetime(1601, 1, 1) + timedelta(seconds=raw_created_date)
-        created_date = epoch_created_date.strftime("%a %b %d %H:%M:%S %Y")
+        project_creation_date = (
+            datetime(1601, 1, 1) + timedelta(seconds=raw_created_date)
+        ).strftime("%a %b %d %H:%M:%S %Y")
+
+        # MajorRev and MinorRev from ext[0x076] bytes[3] and [2]
+        rev_bytes = extended_records.get(0x076, b"\x00\x00\x00\x00")
+        major_rev = str(rev_bytes[3]) if len(rev_bytes) >= 4 else "0"
+        minor_rev = str(rev_bytes[2]) if len(rev_bytes) >= 3 else "0"
+
+        # MajorFaultProgram from ext[0x068] OID → comp_name lookup
+        major_fault_program: Union[str, None] = None
+        if 0x068 in extended_records and len(extended_records[0x068]) >= 4:
+            mfp_oid = struct.unpack_from("<I", extended_records[0x068])[0]
+            if mfp_oid and mfp_oid != 0xFFFFFFFF:
+                self._cur.execute("SELECT comp_name FROM comps WHERE object_id=" + str(mfp_oid))
+                mfp_row = self._cur.fetchone()
+                major_fault_program = mfp_row[0] if mfp_row else None
 
         self._object_id = results[0][1]
         controller_name = results[0][0]
@@ -721,7 +985,9 @@ class ControllerBuilder(L5xElementBuilder):
         data_types: List[DataType] = []
         for result in results:
             _data_type_object_id = result[1]
-            data_types.append(DataTypeBuilder(self._cur, _data_type_object_id).build())
+            dt = DataTypeBuilder(self._cur, _data_type_object_id).build()
+            if dt.cls == "User":
+                data_types.append(dt)
 
         # Get the Controller Scoped Tags
         self._cur.execute(
@@ -741,7 +1007,9 @@ class ControllerBuilder(L5xElementBuilder):
         tags: List[Tag] = []
         for result in results:
             _tag_object_id = result[1]
-            tags.append(TagBuilder(self._cur, _tag_object_id).build())
+            tag = TagBuilder(self._cur, _tag_object_id).build()
+            if tag.data_type and not tag.name.startswith("$") and ":" not in tag.name and not tag.name.startswith("__"):
+                tags.append(tag)
 
         # Get the Program Collection and get the programs
         self._cur.execute(
@@ -763,6 +1031,34 @@ class ControllerBuilder(L5xElementBuilder):
         for result in results:
             _program_object_id = result[1]
             programs.append(ProgramBuilder(self._cur, _program_object_id).build())
+
+        # Build comment_id → program name map for task scheduled-program resolution.
+        # comment_id is a u16 at BLOB offset 0x0C in each program's RxGeneric record.
+        self._cur.execute(
+            "SELECT comp_name, record FROM comps WHERE parent_id=" + str(_program_collection_object_id)
+        )
+        comment_id_to_program: Dict[int, str] = {
+            struct.unpack_from("<H", rec, 0x0C)[0]: pname
+            for pname, rec in self._cur.fetchall()
+        }
+
+        # Get the Task Collection and build Tasks
+        self._cur.execute(
+            "SELECT comp_name, object_id FROM comps WHERE parent_id="
+            + str(self._object_id)
+            + " AND comp_name='RxTaskCollection'"
+        )
+        task_coll_results = self._cur.fetchall()
+        tasks: List[Task] = []
+        if task_coll_results:
+            _task_collection_object_id = task_coll_results[0][1]
+            self._cur.execute(
+                "SELECT comp_name, object_id FROM comps WHERE parent_id="
+                + str(_task_collection_object_id)
+                + " AND record_type=256"
+            )
+            for task_result in self._cur.fetchall():
+                tasks.append(TaskBuilder(self._cur, task_result[1]).build(comment_id_to_program))
 
         # Get the AOI Collection and get the AOIs
         self._cur.execute(
@@ -808,16 +1104,31 @@ class ControllerBuilder(L5xElementBuilder):
 
         return Controller(
             controller_name,
-            serial_number,
-            comm_path,
+            "Target",
+            controller_name,
+            None,           # ProcessorType: not found in binary (omitted from XML)
+            major_rev,
+            minor_rev,
+            major_fault_program,
+            project_creation_date,
+            last_modified_date,
             sfc_execution_control,
             sfc_restart_position,
             sfc_last_scan,
-            created_date,
-            modified_date,
+            project_sn,
+            "false",        # MatchProjectToController
+            "false",        # CanUseRPIFromProducer
+            "0",            # InhibitAutomaticFirmwareUpdate
+            "EnabledWithAppend",  # PassThroughConfiguration
+            "true",         # DownloadProjectDocumentationAndExtendedProperties
+            "true",         # DownloadProjectCustomProperties
+            "false",        # ReportMinorOverflow
+            "false",        # AutoDiagsEnabled
+            "false",        # WebServerEnabled
             data_types,
             tags,
             programs,
+            tasks,
             aois,
             map_devices,
         )
