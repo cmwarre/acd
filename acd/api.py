@@ -1,14 +1,93 @@
 import os
+import tempfile
+import shutil
 import xml.dom.minidom
 from abc import abstractmethod
 from dataclasses import dataclass
 from os import PathLike
+from pathlib import Path
 
 from acd.l5x.export_l5x import ExportL5x
 from acd.zip.unzip import Unzip
+from acd.zip.write_acd import write_acd
+from acd.zip.write_dat import patch_sbregion_dat
 
 from acd.database.acd_database import AcdDatabase
 from acd.l5x.elements import DumpCompsRecords, RSLogix5000Content
+
+
+# Clean top-level API
+
+def load_acd(path, temp_dir: str = None) -> RSLogix5000Content:
+    """Load an ACD file into a Python object model.
+
+    Args:
+        path: Path to the .ACD file.
+        temp_dir: Directory for SQLite and extracted files.  A temporary
+            directory is created and cleaned up automatically if omitted.
+
+    Returns:
+        RSLogix5000Content with a fully populated controller object tree.
+        The project also carries _raw_files / _file_order / _footer_unknown
+        for use by save_acd().
+    """
+    cleanup = temp_dir is None
+    if cleanup:
+        temp_dir = tempfile.mkdtemp(prefix="acd_load_")
+    try:
+        exporter = ExportL5x(str(path), temp_dir)
+        return exporter.project
+    finally:
+        if cleanup:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def save_acd(project: RSLogix5000Content, output_path) -> None:
+    """Write a project object model back to an ACD file.
+
+    The project must have been loaded via load_acd() or ExportL5x so that
+    it carries _raw_files, _file_order, and _footer_unknown.
+
+    Args:
+        project: Project loaded by load_acd().
+        output_path: Destination .ACD file path.
+    """
+    write_acd(
+        files=project._raw_files,
+        output_path=output_path,
+        file_order=project._file_order,
+        footer_unknown=project._footer_unknown,
+    )
+
+
+def patch_rungs(project: RSLogix5000Content, changes: dict) -> None:
+    """Patch rung text in a loaded project's SbRegion.Dat in-place.
+
+    Call this before save_acd() to modify ladder rung logic.
+
+    Args:
+        project: Project loaded by load_acd().
+        changes: Mapping of {rung_object_id: new_rung_text}.
+
+            rung_object_id — the integer object_id for the rung.  Available
+            as routine._rung_ids[i] for the i-th rung in a Routine.
+
+            new_rung_text — the new rung text with plain tag names (not
+            @HEX@ placeholders).  Tag names are resolved back to object_id
+            placeholders automatically using project._id_to_name.
+
+    Example:
+        project = load_acd("project.ACD")
+        routine = project.controller.programs[0].routines[0]
+        changes = {routine._rung_ids[0]: "XIC(MyTag)OTE(OutputTag);"}
+        patch_rungs(project, changes)
+        save_acd(project, "modified.ACD")
+    """
+    project._raw_files["SbRegion.Dat"] = patch_sbregion_dat(
+        project._raw_files["SbRegion.Dat"],
+        changes,
+        project._id_to_name,
+    )
 
 
 # Returned Project Structures

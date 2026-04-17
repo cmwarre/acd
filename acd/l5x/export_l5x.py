@@ -5,7 +5,7 @@ import struct
 from dataclasses import dataclass
 from pathlib import Path
 from sqlite3 import Cursor
-from typing import Union
+from typing import Dict, List, Union
 
 from acd.database.dbextract import DbExtract
 from acd.zip.unzip import Unzip
@@ -78,6 +78,17 @@ class ExportL5x:
         unzip = Unzip(self.input_filename)
         unzip.write_files(self._temp_dir)
 
+        # Preserve all embedded files in original order for round-trip writing.
+        # Read directly from the ACD archive (pre-decompression) so that
+        # compressed files are carried as-is and write-back is byte-identical.
+        self._file_order: List[str] = [r.filename for r in unzip.records]
+        self._footer_unknown: int = unzip.header._unknown_two
+        self._raw_files: Dict[str, bytes] = {}
+        with open(self.input_filename, "rb") as acd_fh:
+            for record in unzip.records:
+                acd_fh.seek(record.file_offset)
+                self._raw_files[record.filename] = acd_fh.read(record.file_length)
+
         log.info("Getting records from ACD Comps file and storing in sqllite database")
         comps_db = DbExtract(os.path.join(self._temp_dir, "Comps.Dat")).read()
         # Deduplicate by object_id (last occurrence wins, matching original behavior)
@@ -89,8 +100,10 @@ class ExportL5x:
         self._cur.executemany("INSERT INTO comps VALUES (?,?,?,?,?,?)", comps_by_id.values())
         self._db.commit()
 
-        # Build name lookup for SbRegion tag reference resolution (object_id → comp_name)
+        # Build name lookup for SbRegion tag reference resolution (object_id → comp_name).
+        # Store on self for use during write-back (patch_sbregion_dat needs id_to_name).
         name_lookup = {oid: t[2] for oid, t in comps_by_id.items()}
+        self._id_to_name: Dict[int, str] = name_lookup
 
         log.info(
             "Getting records from ACD Region Map file and storing in sqllite database"
@@ -143,6 +156,10 @@ class ExportL5x:
                 Path(os.path.join(self._temp_dir, "QuickInfo.XML"))
             ).build()
             self._project.controller = self.controller
+            self._project._raw_files = self._raw_files
+            self._project._file_order = self._file_order
+            self._project._footer_unknown = self._footer_unknown
+            self._project._id_to_name = self._id_to_name
         return self._project
 
     def populate_region_map(self):
