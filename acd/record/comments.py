@@ -35,6 +35,14 @@ class CommentsRecord:
                 rung_content = struct.unpack_from("<I", bytes(r.body.unknown_1), 4)[0]
             else:
                 rung_content = 0
+            # Extract bytes [0:4] of unknown_1 as member_ref.
+            # For the object's own description (DataType, AOI, etc.) this is zero.
+            # For sub-element descriptions (UDT members, AOI parameters/local tags)
+            # this is non-zero, enabling callers to filter to just the object-level description.
+            if r.header.record_type in (0x01, 0x02) and len(bytes(r.body.unknown_1)) >= 4:
+                member_ref = struct.unpack_from("<I", bytes(r.body.unknown_1), 0)[0]
+            else:
+                member_ref = 0
             return (
                 r.header.seq_number,
                 r.header.sub_record_length,
@@ -44,6 +52,7 @@ class CommentsRecord:
                 r.header.parent,
                 tag_ref,
                 rung_content,
+                member_ref,
             )
         except Exception:
             return None
