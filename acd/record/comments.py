@@ -16,7 +16,7 @@ class CommentsRecord:
     def __post_init__(self):
         entry = CommentsRecord.parse(self.dat_record)
         if entry is not None:
-            self._cur.execute("INSERT INTO comments VALUES (?, ?, ?, ?, ?, ?, ?, ?)", entry)
+            self._cur.execute("INSERT INTO comments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", entry)
 
     @staticmethod
     def _parse_udi_body(body: bytes) -> Optional[tuple]:
@@ -82,7 +82,8 @@ class CommentsRecord:
                     r.header.record_type,
                     r.header.parent,
                     "__REVISION_NOTE__",
-                    0,
+                    0,              # rung_content
+                    0,              # member_ref
                 )
             if r.header.record_type in (0x03, 0x04, 0x0D, 0x0E):
                 tag_ref = r.body.tag_reference.value
