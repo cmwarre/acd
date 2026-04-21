@@ -57,15 +57,15 @@ PORT_STRUCTURES: Dict[Tuple[int, int, int], List[PortDef]] = {
     # applies to Port 2; Port 1 is always downstream.
     (1, 14, 166): [  # 1756-L83E
         PortDef(port_id=1, port_type="ICP",      upstream_fixed=True,  upstream_port=False, address_mode="slot",  bus_mode="fixed:17"),
-        PortDef(port_id=2, port_type="Ethernet",  upstream_fixed=False, upstream_port=False, address_mode="omit",  bus_mode="always"),
+        PortDef(port_id=2, port_type="Ethernet",  upstream_fixed=False, upstream_port=False, address_mode="empty", bus_mode="always"),
     ],
     (1, 14, 167): [  # 1756-L84E
         PortDef(port_id=1, port_type="ICP",      upstream_fixed=True,  upstream_port=False, address_mode="slot",  bus_mode="fixed:17"),
-        PortDef(port_id=2, port_type="Ethernet",  upstream_fixed=False, upstream_port=False, address_mode="omit",  bus_mode="always"),
+        PortDef(port_id=2, port_type="Ethernet",  upstream_fixed=False, upstream_port=False, address_mode="empty", bus_mode="always"),
     ],
     (1, 14, 168): [  # 1756-L85E
         PortDef(port_id=1, port_type="ICP",      upstream_fixed=True,  upstream_port=False, address_mode="slot",  bus_mode="fixed:17"),
-        PortDef(port_id=2, port_type="Ethernet",  upstream_fixed=False, upstream_port=False, address_mode="omit",  bus_mode="always"),
+        PortDef(port_id=2, port_type="Ethernet",  upstream_fixed=False, upstream_port=False, address_mode="empty", bus_mode="always"),
     ],
 
     # --- Older ControlLogix CPUs (no Ethernet port) PT=14 ---

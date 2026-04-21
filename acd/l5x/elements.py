@@ -15,6 +15,16 @@ from acd.generated.comps.rx_generic import RxGeneric
 from acd.l5x.catalog_numbers import CATALOG_NUMBERS
 from acd.l5x.port_structures import PORT_STRUCTURES
 
+# Logix Designer enforces a 1000-character limit on tag/AOI description text.
+_MAX_DESCRIPTION_LEN = 1000
+
+
+def _truncate_description(text: "Union[str, None]") -> "Union[str, None]":
+    """Return text truncated to _MAX_DESCRIPTION_LEN characters, or None if falsy."""
+    if not text:
+        return text
+    return text[:_MAX_DESCRIPTION_LEN] if len(text) > _MAX_DESCRIPTION_LEN else text
+
 
 @dataclass
 class L5xElementBuilder:
@@ -67,9 +77,12 @@ class L5xElement:
                                 new_child_list.append(element.to_xml())
                             else:
                                 new_child_list.append(f"<{element}/>")
-                        child_list.append(
-                            f'<{section_name}>{"".join(new_child_list)}</{section_name}>'
-                        )
+                        # Omit the section wrapper entirely when there are no children.
+                        # An empty <ScheduledPrograms/> (and similar) is invalid in Logix.
+                        if new_child_list:
+                            child_list.append(
+                                f'<{section_name}>{"".join(new_child_list)}</{section_name}>'
+                            )
                 else:
                     if attribute == "cls":
                         attribute = "class"
@@ -454,6 +467,7 @@ class Tag(L5xElement):
         # longest entry — short entries like "Spare" or "End CIP" are element labels.
         candidates = [text for ref, text in self._comments if ref in ("", ".") and text]
         desc_raw = max(candidates, key=len) if candidates else None
+        desc_raw = _truncate_description(desc_raw)
         desc = self._sanitize_xml_text(desc_raw) if desc_raw else None
         desc_xml = f'<Description>\n<![CDATA[{desc}]]>\n</Description>' if desc else ""
 
@@ -689,8 +703,8 @@ class Module(L5xElement):
                     addr_attr = f' Address="{self._slot if self._slot != 0xFFFFFFFF else 0}"'
             elif pd.address_mode == "zero":
                 addr_attr = ' Address="0"'
-            else:  # "empty" — use IP from binary if present, else omit value
-                addr_attr = f' Address="{self._ip_address}"'
+            else:  # "empty" — use IP from binary if present, else omit attribute
+                addr_attr = f' Address="{self._ip_address}"' if self._ip_address else ""
 
             # --- Bus element ---
             # Bus is only emitted on downstream (Upstream="false") ports.
@@ -724,9 +738,11 @@ class Module(L5xElement):
         if mode == "always":
             return "<Bus/>"
         if mode.startswith("fixed:"):
-            # Use binary chassis size when available (read from RxDataCollection);
-            # fall back to the hardcoded port_structures value.
-            if self._chassis_size is not None:
+            # Use binary chassis size only for ICP (backplane) ports where the actual
+            # slot count varies by chassis model. For Flex, 5094, HART and other buses
+            # the hardcoded port_structures value is authoritative — the binary stores
+            # a connection-level count that differs from the bus capacity.
+            if self._chassis_size is not None and pd.port_type == "ICP":
                 return f'<Bus Size="{self._chassis_size}"/>'
             size = mode.split(":")[1]
             return f'<Bus Size="{size}"/>'
@@ -908,14 +924,15 @@ class Controller(L5xElement):
         open_tag = base[: idx + 1]
         inner = base[idx + 1 : -len("</Controller>")]
         # RedundancyInfo: Enabled comes from binary; no pad attributes in golden.
+        # Must appear immediately after the opening Controller tag (before Modules/Tags etc).
         redundancy_enabled_str = "true" if self._redundancy_enabled else "false"
         redundancy_info = (
             f'<RedundancyInfo Enabled="{redundancy_enabled_str}" KeepTestEditsOnSwitchOver="false"/>'
         )
         return (
             open_tag
-            + inner
             + redundancy_info
+            + inner
             + '<Security Code="0" ChangesToDetect="16#ffff_ffff_ffff_ffff"/>'
             + '<SafetyInfo/>'
             + '<CST MasterID="0"/>'
@@ -1096,7 +1113,7 @@ class MemberBuilder(L5xElementBuilder):
                 )
                 desc_row = self._cur.fetchone()
                 if desc_row and desc_row[0]:
-                    description = desc_row[0]
+                    description = _truncate_description(desc_row[0])
 
         return Member(name, name, data_type, dimension, radix, hidden, target, bit_number, external_access, description)
 
@@ -1204,7 +1221,7 @@ class DataTypeBuilder(L5xElementBuilder):
         )
         desc_row = self._cur.fetchone()
         if desc_row and desc_row[0]:
-            description = desc_row[0]
+            description = _truncate_description(desc_row[0])
 
         return DataType(name, name, string_family, class_type, children, description)
 
@@ -1448,7 +1465,7 @@ class ModuleBuilder(L5xElementBuilder):
         )
         desc_row = self._cur.fetchone()
         if desc_row:
-            description = desc_row[0] or ""
+            description = _truncate_description(desc_row[0] or "") or ""
 
         # --- Communications and ExtendedProperties ---
         # Both are extracted from the hash-named child of RxDataCollection that
@@ -1467,23 +1484,31 @@ class ModuleBuilder(L5xElementBuilder):
         # Connection Type is inferred from the name (heuristic):
         #   names containing "output" or equal to "config" -> "Output"
         #   all others -> "Input"
-        # RPI: we do not have a reliable binary decoder for the short connection
-        # records seen in the test data, so we default to "0.0" (acceptable for import).
+        # RPI: stored at byte offset 0x5C as a u32 (microseconds) in each connection
+        # record.  A value of 0 means the binary did not supply an RPI; we default
+        # to "200000" (200 ms) which is a safe Logix import default.
         self._cur.execute(
-            "SELECT c2.comp_name FROM comps c1 "
+            "SELECT c2.comp_name, c2.record FROM comps c1 "
             "JOIN comps c2 ON c2.parent_id = c1.object_id "
             "WHERE c1.parent_id = ? AND c1.comp_name = 'RxMapConnectionCollection' "
             "AND c2.comp_name NOT IN ('Output') "
             "ORDER BY c2.seq_number",
             (self._object_id,),
         )
-        for (conn_name,) in self._cur.fetchall():
+        for (conn_name, conn_rec) in self._cur.fetchall():
             name_lower = conn_name.lower()
             if "output" in name_lower or name_lower == "config":
                 conn_type = "Output"
             else:
                 conn_type = "Input"
-            connections.append((conn_name, "0.0", conn_type))
+            # Extract RPI from offset 0x5C; fall back to 200000 if record is short or zero.
+            conn_bytes = bytes(conn_rec)
+            rpi_val = 0
+            if len(conn_bytes) >= 0x60:
+                rpi_val = struct.unpack("<I", conn_bytes[0x5C:0x60])[0]
+            if rpi_val == 0:
+                rpi_val = 200000
+            connections.append((conn_name, str(rpi_val), conn_type))
 
         return Module(
             name,           # L5xElement._name (private)
@@ -1712,7 +1737,7 @@ class ParameterBuilder(L5xElementBuilder):
                 )
                 desc_row = self._cur.fetchone()
                 if desc_row and desc_row[0]:
-                    description = desc_row[0]
+                    description = _truncate_description(desc_row[0])
 
         return Parameter(
             name,
@@ -1785,7 +1810,7 @@ class LocalTagBuilder(L5xElementBuilder):
                 )
                 desc_row = self._cur.fetchone()
                 if desc_row and desc_row[0]:
-                    description = desc_row[0]
+                    description = _truncate_description(desc_row[0])
 
         return LocalTag(name, name, data_type, dimensions, radix, external_access, description)
 
@@ -2069,7 +2094,7 @@ class AoiBuilder(L5xElementBuilder):
             )
             desc_row = self._cur.fetchone()
             if desc_row and desc_row[0]:
-                aoi_description = desc_row[0]
+                aoi_description = _truncate_description(desc_row[0])
             try:
                 self._cur.execute(
                     "SELECT record_string FROM comments WHERE parent=? AND tag_reference='__REVISION_NOTE__' LIMIT 1",
@@ -2470,6 +2495,48 @@ class ControllerBuilder(L5xElementBuilder):
         for result in results:
             _aoi_object_id = result[1]
             aois.append(AoiBuilder(self._cur, _aoi_object_id).build())
+
+        # Topological sort: Logix requires each AOI's data-type dependencies to appear
+        # before the AOI that references them.  Dependencies arise when an AOI has a
+        # LocalTag or Parameter whose DataType is itself another AOI in this list.
+        _aoi_names = {a.name for a in aois}
+        _aoi_by_name: Dict[str, "AOI"] = {a.name: a for a in aois}
+        _aoi_deps: Dict[str, set] = {a.name: set() for a in aois}
+        for a in aois:
+            for lt in a.local_tags:
+                if lt.data_type in _aoi_names and lt.data_type != a.name:
+                    _aoi_deps[a.name].add(lt.data_type)
+            for p in a.parameters:
+                if p.data_type in _aoi_names and p.data_type != a.name:
+                    _aoi_deps[a.name].add(p.data_type)
+        _aoi_in_degree: Dict[str, int] = {a.name: len(_aoi_deps[a.name]) for a in aois}
+        _aoi_children: Dict[str, List[str]] = {a.name: [] for a in aois}
+        for a in aois:
+            for dep in _aoi_deps[a.name]:
+                _aoi_children[dep].append(a.name)
+        _aoi_orig_order = [a.name for a in aois]
+        _aoi_queue = [n for n in _aoi_orig_order if _aoi_in_degree[n] == 0]
+        _aoi_sorted: List["AOI"] = []
+        _aoi_visited: set = set()
+        while _aoi_queue:
+            n = _aoi_queue.pop(0)
+            if n in _aoi_visited:
+                continue
+            _aoi_visited.add(n)
+            _aoi_sorted.append(_aoi_by_name[n])
+            next_ready = [
+                c for c in _aoi_orig_order
+                if c in _aoi_children[n] and c not in _aoi_visited
+            ]
+            for child in next_ready:
+                _aoi_in_degree[child] -= 1
+                if _aoi_in_degree[child] == 0:
+                    _aoi_queue.append(child)
+        # Append any remaining AOIs that weren't reached (cycles or isolated).
+        for n in _aoi_orig_order:
+            if n not in _aoi_visited:
+                _aoi_sorted.append(_aoi_by_name[n])
+        aois = _aoi_sorted
 
         # Get the Module (IO) Collection and build all Module elements.
         self._cur.execute(
