@@ -92,7 +92,7 @@ class Member(L5xElement):
     name: str
     data_type: str
     dimension: int
-    radix: str
+    radix: Union[str, None]
     hidden: bool
     target: Union[str, None]      # BIT members only; None omits the attribute
     bit_number: Union[int, None]  # BIT members only; None omits the attribute
@@ -882,10 +882,10 @@ class Controller(L5xElement):
     web_server_enabled: str
     data_types: List[DataType]
     modules: List[Module]
+    aois: List[AOI]
     tags: List[Tag]
     programs: List[Program]
     tasks: List[Task]
-    aois: List[AOI]
     # _redundancy_enabled is NOT serialised as a regular XML attribute (underscore prefix
     # skips it in the base to_xml()); it is used only to build the <RedundancyInfo> element.
     _redundancy_enabled: bool = field(default=False)
@@ -945,9 +945,9 @@ class RSLogix5000Content(L5xElement):
         self._export_name = "RSLogix5000Content"
 
 
-def radix_enum(i: int) -> str:
+def radix_enum(i: int) -> Union[str, None]:
     if i == 0:
-        return "NullType"
+        return None  # omit Radix attribute for complex/unspecified types
     if i == 1:
         return "General"
     if i == 2:
@@ -1071,6 +1071,14 @@ class MemberBuilder(L5xElementBuilder):
                 bit_number = struct.unpack_from("<I", self.record, 0x64)[0]
                 val_60 = struct.unpack_from("<I", self.record, 0x60)[0]
                 target = self._offset60_to_name.get(val_60)
+        else:
+            # For non-BOOL members, offset 0x5C is a true array dimension only when
+            # 0x68 == 0x800 (standard UDT member layout). All other values of 0x68
+            # (e.g. 0x60 for AOI parameter references) store a byte offset at 0x5C,
+            # not an element count.
+            val_68 = struct.unpack_from("<I", self.record, 0x68)[0]
+            if val_68 != 0x800:
+                dimension = 0
 
         # --- Description ---
         # The member's description is identified in the comments table by a
@@ -2504,6 +2512,48 @@ class ControllerBuilder(L5xElementBuilder):
                     ModuleBuilder(self._cur, mod_oid, modid_to_name).build()
                 )
 
+            # Topological sort: Logix Designer requires each module's ParentModule to
+            # appear earlier in the <Modules> list than the module itself.  The database
+            # seq_number order does not guarantee this, so we perform a Kahn's-algorithm
+            # BFS sort keyed on parent_module name.
+            #
+            # Modules that are self-parenting (Local / CPU root) have parent_module == name,
+            # so they naturally have in-degree 0 and are emitted first.
+            _mod_by_name: Dict[str, "Module"] = {m.name: m for m in modules}
+            # in-degree: number of distinct parents that are themselves modules in this set
+            _in_degree: Dict[str, int] = {m.name: 0 for m in modules}
+            _children: Dict[str, List[str]] = {m.name: [] for m in modules}
+            for m in modules:
+                parent = m.parent_module
+                if parent != m.name and parent in _mod_by_name:
+                    _in_degree[m.name] += 1
+                    _children[parent].append(m.name)
+            # Seed the queue with all zero-in-degree modules, preserving original relative order.
+            _orig_order = [m.name for m in modules]
+            _queue = [name for name in _orig_order if _in_degree[name] == 0]
+            _sorted: List["Module"] = []
+            _visited: set = set()
+            while _queue:
+                name = _queue.pop(0)
+                if name in _visited:
+                    continue
+                _visited.add(name)
+                _sorted.append(_mod_by_name[name])
+                # Emit children in their original relative order.
+                next_ready = [
+                    c for c in _orig_order
+                    if c in _children[name] and c not in _visited
+                ]
+                for child in next_ready:
+                    _in_degree[child] -= 1
+                    if _in_degree[child] == 0:
+                        _queue.append(child)
+            # Any remaining modules (cycles or unresolved parents) appended in original order.
+            for name in _orig_order:
+                if name not in _visited:
+                    _sorted.append(_mod_by_name[name])
+            modules = _sorted
+
             # Third pass: compute (parent_name, parent_port_id) → child count,
             # then inject the relevant sub-dict into each Module as _port_child_counts.
             child_counts: Dict[tuple, int] = {}
@@ -2573,10 +2623,10 @@ class ControllerBuilder(L5xElementBuilder):
             "false",        # WebServerEnabled
             data_types,
             modules,
+            aois,
             tags,
             programs,
             tasks,
-            aois,
             redundancy_enabled,
         )
 
