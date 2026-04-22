@@ -592,6 +592,14 @@ class Module(L5xElement):
     _extended_properties: str = field(default="")
     _prim_cxn_input_size: Union[int, None] = field(default=None)
     _prim_cxn_output_size: Union[int, None] = field(default=None)
+    # Drive peripheral (RHINOBP) modules carry UserDefined* attributes that
+    # record the original identity before the canonical PT=0/PC=28 override.
+    _ud_vendor: Union[int, None] = field(default=None)
+    _ud_product_type: Union[int, None] = field(default=None)
+    _ud_product_code: Union[int, None] = field(default=None)
+    _ud_major: Union[int, None] = field(default=None)
+    _ud_minor: Union[int, None] = field(default=None)
+    _ud_catalog_number: str = field(default="")
 
     def __post_init__(self):
         super().__post_init__()
@@ -600,6 +608,34 @@ class Module(L5xElement):
     def to_xml(self) -> str:
         # Hash-named drive peripherals have no Name attribute in Logix-exported L5X.
         name_attr = "" if self.name == "?" else f'Name="{self.name}" '
+
+        # UserDefined* attributes are only present on RHINOBP drive peripheral modules.
+        # They record the original device identity before the canonical PT=0/PC=28 override.
+        # Logix Designer also emits ShutdownParentOnFault, DrivesADCMode, DrivesADCEnabled
+        # (all false) and UserDefinedCatalogNumber on these modules.
+        if self._ud_product_code is not None:
+            ud_attrs = (
+                f'UserDefinedVendor="{self._ud_vendor}" '
+                f'UserDefinedProductType="{self._ud_product_type}" '
+                f'UserDefinedProductCode="{self._ud_product_code}" '
+                f'UserDefinedMajor="{self._ud_major}" '
+                f'UserDefinedMinor="{self._ud_minor}" '
+            )
+            trailing_attrs = (
+                f'Inhibited="{self.inhibited}" '
+                f'MajorFault="{self.major_fault}" '
+                f'ShutdownParentOnFault="false" '
+                f'DrivesADCMode="false" '
+                f'DrivesADCEnabled="false" '
+                f'UserDefinedCatalogNumber="{html.escape(self._ud_catalog_number, quote=True)}"'
+            )
+        else:
+            ud_attrs = ""
+            trailing_attrs = (
+                f'Inhibited="{self.inhibited}" '
+                f'MajorFault="{self.major_fault}"'
+            )
+
         attrs = (
             f'{name_attr}'
             f'CatalogNumber="{self.catalog_number}" '
@@ -608,10 +644,10 @@ class Module(L5xElement):
             f'ProductCode="{self.product_code}" '
             f'Major="{self.major}" '
             f'Minor="{self.minor}" '
+            f'{ud_attrs}'
             f'ParentModule="{self.parent_module}" '
             f'ParentModPortId="{self.parent_mod_port_id}" '
-            f'Inhibited="{self.inhibited}" '
-            f'MajorFault="{self.major_fault}"'
+            f'{trailing_attrs}'
         )
 
         # Optional <Description>
@@ -1426,9 +1462,29 @@ class ModuleBuilder(L5xElementBuilder):
         # Hash-named modules are drive peripheral expansion cards. The ACD binary stores
         # them with ProductType=123 and site-specific ProductCodes, but Logix exports them
         # all as PT=0 PC=28 (RHINOBP-DRIVE-PERIPHERAL-MODULE) without a Name attribute.
+        # Save the original identity for UserDefined* XML attributes before overwriting.
+        ud_vendor = ud_product_type = ud_product_code = ud_major = ud_minor = None
+        ud_catalog_number = ""
         if name == "?":
+            ud_vendor = vendor
+            ud_product_type = product_type
+            ud_product_code = product_code
+            ud_major = major
+            ud_minor = minor
+            # UserDefinedCatalogNumber is the human-readable peripheral type string.
+            # These four product codes are the only ones seen in PowerFlex 753 projects;
+            # add more as new peripherals are encountered.
+            _RHINOBP_CATALOG = {
+                767:   "20-HIM-x6",
+                16544: "Safe Torque Off",
+                8192:  "20-COMM-E",
+                33184: "DeviceLogix",
+            }
+            ud_catalog_number = _RHINOBP_CATALOG.get(product_code, "")
             product_type = 0
             product_code = 28
+            major = 1
+            minor = 1
 
         # Resolve parent module name from the modid→name map built by ControllerBuilder.
         parent_name = self._modid_to_name.get(parent_modid, "Local")
@@ -1437,6 +1493,17 @@ class ModuleBuilder(L5xElementBuilder):
         major_fault = "true" if parent_name == name else "false"
         # bit 2 (0x04) of e1[0] → EKey Disabled (Local=0x06→Disabled, EN2T=0x11→CompatibleModule).
         ekey_state  = "Disabled" if (e1[0] & 0x04) else "CompatibleModule"
+        # RHINOBP drive peripheral modules: EKey is determined by the peripheral type
+        # (UserDefinedProductCode) rather than by the identity-flag bit in e1[0], which is
+        # always 0x01 for all peripheral types in PowerFlex 753 projects.
+        if ud_product_code is not None:
+            _RHINOBP_EKEY = {
+                767:   "Disabled",          # 20-HIM-x6
+                16544: "CompatibleModule",   # Safe Torque Off
+                8192:  "CompatibleModule",   # 20-COMM-E
+                33184: "Disabled",           # DeviceLogix
+            }
+            ekey_state = _RHINOBP_EKEY.get(ud_product_code, "CompatibleModule")
 
         # IP address: stored at e1[0x30] as a u16 length-prefixed ASCII string for modules
         # that connect via Ethernet upstream (parent_port == 2). Local backplane bridge
@@ -1506,7 +1573,13 @@ class ModuleBuilder(L5xElementBuilder):
         comm_method: Union[str, None] = None
         connections: List[Tuple[str, str, str]] = []
         extended_properties = ""
-        if not _is_flex_io and (slot or ip_address):
+        # RHINOBP drive peripheral modules (hash-named, ud_product_code set) must not use
+        # _comms_from_data_collection: their slot field holds a RhinoBP bus address, not an
+        # ICP backplane slot, and the lookup would match an unrelated backplane module.
+        # Their Communications section (ConfigData/ConfigScript) is not yet decoded, so we
+        # leave comm_method=None which suppresses the <Communications> block entirely.
+        _is_rhinobp = (ud_product_code is not None)
+        if not _is_flex_io and not _is_rhinobp and (slot or ip_address):
             comm_method, extended_properties = self._comms_from_data_collection(
                 slot, ip_address
             )
@@ -1528,7 +1601,7 @@ class ModuleBuilder(L5xElementBuilder):
         # RPI: stored at byte offset 0x5C as a u32 (microseconds) in each connection
         # record.  A value of 0 means the binary did not supply an RPI; we default
         # to "200000" (200 ms) which is a safe Logix import default.
-        if not _is_flex_io:
+        if not _is_flex_io and not _is_rhinobp:
             self._cur.execute(
                 "SELECT c2.comp_name, c2.record FROM comps c1 "
                 "JOIN comps c2 ON c2.parent_id = c1.object_id "
@@ -1576,6 +1649,12 @@ class ModuleBuilder(L5xElementBuilder):
             _extended_properties=extended_properties,
             _prim_cxn_input_size=prim_input_size,
             _prim_cxn_output_size=prim_output_size,
+            _ud_vendor=ud_vendor,
+            _ud_product_type=ud_product_type,
+            _ud_product_code=ud_product_code,
+            _ud_major=ud_major,
+            _ud_minor=ud_minor,
+            _ud_catalog_number=ud_catalog_number,
         )
 
 
@@ -1918,7 +1997,12 @@ class RoutineBuilder(L5xElementBuilder):
                 self._cur.execute("SELECT comp_name FROM comps WHERE object_id=?", (oid,))
                 row2 = self._cur.fetchone()
                 if row2:
-                    id_to_name[hex_id] = row2[0]
+                    # Strip internal ACD module-alias prefix (e.g. "__Map:Eth_HMI"
+                    # -> "Eth_HMI") so it never leaks into exported rung text.
+                    raw_name = row2[0]
+                    if raw_name.startswith("__Map:"):
+                        raw_name = raw_name[len("__Map:"):]
+                    id_to_name[hex_id] = raw_name
             if id_to_name:
                 def _resolve(rung: str) -> str:
                     return _re.sub(
@@ -2644,43 +2728,54 @@ class ControllerBuilder(L5xElementBuilder):
             # Topological sort: Logix Designer requires each module's ParentModule to
             # appear earlier in the <Modules> list than the module itself.  The database
             # seq_number order does not guarantee this, so we perform a Kahn's-algorithm
-            # BFS sort keyed on parent_module name.
+            # BFS sort keyed on integer index.
             #
-            # Modules that are self-parenting (Local / CPU root) have parent_module == name,
-            # so they naturally have in-degree 0 and are emitted first.
-            _mod_by_name: Dict[str, "Module"] = {m.name: m for m in modules}
-            # in-degree: number of distinct parents that are themselves modules in this set
-            _in_degree: Dict[str, int] = {m.name: 0 for m in modules}
-            _children: Dict[str, List[str]] = {m.name: [] for m in modules}
-            for m in modules:
-                parent = m.parent_module
-                if parent != m.name and parent in _mod_by_name:
-                    _in_degree[m.name] += 1
-                    _children[parent].append(m.name)
-            # Seed the queue with all zero-in-degree modules, preserving original relative order.
-            _orig_order = [m.name for m in modules]
-            _queue = [name for name in _orig_order if _in_degree[name] == 0]
+            # IMPORTANT: Multiple modules can share the same name (all RHINOBP drive
+            # peripheral modules are named "?").  Using name as the dict key would collapse
+            # them all to one entry, silently dropping all but the last.  We therefore key
+            # every data structure on the integer list index (0..N-1) and resolve parent
+            # relationships by looking up the first module whose name matches the parent_module
+            # attribute.  RHINOBP peripherals are always leaf nodes (no other module lists
+            # one as its parent), so duplicate-name collisions in the parent lookup are safe.
+            #
+            # Build a name→first-index map for parent resolution (named modules only —
+            # "?" peripherals are never parents so they don't need to be in this map).
+            _name_to_idx: Dict[str, int] = {}
+            for _i, _m in enumerate(modules):
+                if _m.name != "?" and _m.name not in _name_to_idx:
+                    _name_to_idx[_m.name] = _i
+
+            # in-degree and children are keyed by index.
+            _n = len(modules)
+            _in_degree_idx: List[int] = [0] * _n
+            _children_idx: List[List[int]] = [[] for _ in range(_n)]
+            for _i, _m in enumerate(modules):
+                parent_name = _m.parent_module
+                if parent_name != _m.name and parent_name in _name_to_idx:
+                    _parent_idx = _name_to_idx[parent_name]
+                    _in_degree_idx[_i] += 1
+                    _children_idx[_parent_idx].append(_i)
+
+            # Seed the queue with all zero-in-degree indices, preserving original order.
+            _queue_idx = [_i for _i in range(_n) if _in_degree_idx[_i] == 0]
             _sorted: List["Module"] = []
-            _visited: set = set()
-            while _queue:
-                name = _queue.pop(0)
-                if name in _visited:
+            _visited_idx: set = set()
+            while _queue_idx:
+                _i = _queue_idx.pop(0)
+                if _i in _visited_idx:
                     continue
-                _visited.add(name)
-                _sorted.append(_mod_by_name[name])
+                _visited_idx.add(_i)
+                _sorted.append(modules[_i])
                 # Emit children in their original relative order.
-                next_ready = [
-                    c for c in _orig_order
-                    if c in _children[name] and c not in _visited
-                ]
-                for child in next_ready:
-                    _in_degree[child] -= 1
-                    if _in_degree[child] == 0:
-                        _queue.append(child)
+                for _child_idx in sorted(_children_idx[_i]):
+                    if _child_idx not in _visited_idx:
+                        _in_degree_idx[_child_idx] -= 1
+                        if _in_degree_idx[_child_idx] == 0:
+                            _queue_idx.append(_child_idx)
             # Any remaining modules (cycles or unresolved parents) appended in original order.
-            for name in _orig_order:
-                if name not in _visited:
-                    _sorted.append(_mod_by_name[name])
+            for _i in range(_n):
+                if _i not in _visited_idx:
+                    _sorted.append(modules[_i])
             modules = _sorted
 
             # Third pass: compute (parent_name, parent_port_id) → child count,
