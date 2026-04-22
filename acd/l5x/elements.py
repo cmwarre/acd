@@ -590,6 +590,8 @@ class Module(L5xElement):
     # Each entry: (name, rpi_str, conn_type_str)
     _connections: List[Tuple[str, str, str]] = field(default_factory=list)
     _extended_properties: str = field(default="")
+    _prim_cxn_input_size: Union[int, None] = field(default=None)
+    _prim_cxn_output_size: Union[int, None] = field(default=None)
 
     def __post_init__(self):
         super().__post_init__()
@@ -656,8 +658,13 @@ class Module(L5xElement):
                     )
             joined = "".join(conn_parts)
             connections_xml = f'<Connections>{joined}</Connections>' if joined else '<Connections/>'
+            comm_attrs = f'CommMethod="{self._comm_method}"'
+            if self._prim_cxn_input_size is not None:
+                comm_attrs += f' PrimCxnInputSize="{self._prim_cxn_input_size}"'
+            if self._prim_cxn_output_size is not None:
+                comm_attrs += f' PrimCxnOutputSize="{self._prim_cxn_output_size}"'
             comm_xml = (
-                f'<Communications CommMethod="{self._comm_method}">'
+                f'<Communications {comm_attrs}>'
                 f'{connections_xml}'
                 f'</Communications>'
             )
@@ -829,7 +836,13 @@ class AOI(L5xElement):
             inject += f'<Description>\n<![CDATA[{self._description}]]>\n</Description>'
         if self._revision_note:
             inject += f'<RevisionNote>\n<![CDATA[{self._revision_note}]]>\n</RevisionNote>'
-        return base[:idx + 1] + inject + base[idx + 1:]
+        result = base[:idx + 1] + inject + base[idx + 1:]
+        # L5X schema requires <LocalTags/> even when there are no local tags.
+        # The base to_xml() omits the section entirely when the list is empty,
+        # so we inject an empty self-closing element before <Routines> if absent.
+        if '<LocalTags' not in result:
+            result = result.replace('<Routines>', '<LocalTags/><Routines>', 1)
+        return result
 
 
 @dataclass
@@ -1393,6 +1406,8 @@ class ModuleBuilder(L5xElementBuilder):
             return Module(name, name, "", 0, 0, 0, 0, 0, "Local", 1, "false", "false")
 
         exts: Dict[int, bytes] = {er.attribute_id: bytes(er.value) for er in r.extended_records}
+        prim_input_size  = struct.unpack("<I", exts[0x141])[0] if 0x141 in exts else None
+        prim_output_size = struct.unpack("<I", exts[0x142])[0] if 0x142 in exts else None
         e1 = exts.get(0x001, b"")
         if len(e1) < 0x30:
             major_fault = "true" if name == "Local" else "false"
@@ -1559,6 +1574,8 @@ class ModuleBuilder(L5xElementBuilder):
             _comm_method=comm_method,
             _connections=connections,
             _extended_properties=extended_properties,
+            _prim_cxn_input_size=prim_input_size,
+            _prim_cxn_output_size=prim_output_size,
         )
 
 
@@ -2064,11 +2081,20 @@ class AoiBuilder(L5xElementBuilder):
                 + " AND record_type != 512"
                 + " ORDER BY seq_number"
             )
+            # Collect parameters and local tags, tagging each parameter with the
+            # positional index stored at raw_rec[0x10] (u16).  The ACD binary stores
+            # this index for every parameter so that the correct argument order in
+            # rung calls is preserved across all AOIs.  seq_number is NOT reliable
+            # for ordering — many AOIs have all parameters at the same seq_number —
+            # so we must sort on this explicit position field instead.
+            _pending_params: list = []  # (pos_idx, child_oid)
             for child_oid, child_rec in self._cur.fetchall():
                 child_rec = bytes(child_rec)
                 # Determine whether this is a parameter or a local tag by inspecting
-                # ext01[0x20E]: bits 0x04 (Input) or 0x08 (Output) indicate a parameter.
+                # the usage flags in ext01: bits 0x04 (Input) or 0x08 (Output) set
+                # means it is a public parameter; neither set means a local tag.
                 is_param = False
+                pos_idx = 0xFFFF  # default: sort to end if index is unreadable
                 try:
                     r_child = RxGeneric.from_bytes(child_rec)
                     exts_child: Dict[int, bytes] = {
@@ -2078,19 +2104,28 @@ class AoiBuilder(L5xElementBuilder):
                     ext01 = exts_child.get(0x01, b"")
                     flags = _aoi_tag_usage_flags(ext01)
                     is_param = bool(flags & 0x0C)
+                    if is_param and len(child_rec) > 0x11:
+                        pos_idx = struct.unpack_from("<H", child_rec, 0x10)[0]
                 except Exception:
                     pass
 
                 if is_param:
-                    try:
-                        parameters.append(ParameterBuilder(self._cur, child_oid).build())
-                    except Exception:
-                        pass
+                    _pending_params.append((pos_idx, child_oid))
                 else:
                     try:
                         local_tags.append(LocalTagBuilder(self._cur, child_oid).build())
                     except Exception:
                         pass
+
+            # Sort parameters by their binary positional index before building so
+            # that the emitted <Parameters> list matches the rung-call argument order
+            # that Logix Designer enforces on import.
+            _pending_params.sort(key=lambda t: t[0])
+            for _, child_oid in _pending_params:
+                try:
+                    parameters.append(ParameterBuilder(self._cur, child_oid).build())
+                except Exception:
+                    pass
 
         # --- Extract Routines from RxRoutineCollection ---
         self._cur.execute(

@@ -41,4 +41,5 @@ CATALOG_NUMBERS: Dict[Tuple[int, int, int], str] = {
     (1182, 43, 4155): "Promass_300_500",
     (1182, 43, 4156): "Promag_300_500",
     (1182, 43, 4170): "Promass_100",
+    (322, 12, 1422): "AC1422",
 }
