@@ -15,8 +15,8 @@ from acd.generated.comps.rx_generic import RxGeneric
 from acd.l5x.catalog_numbers import CATALOG_NUMBERS
 from acd.l5x.port_structures import PORT_STRUCTURES
 
-# Logix Designer enforces a 1000-character limit on tag/AOI description text.
-_MAX_DESCRIPTION_LEN = 1000
+# Logix Designer enforces a ~512-character limit on tag/AOI description text.
+_MAX_DESCRIPTION_LEN = 500
 
 
 def _truncate_description(text: "Union[str, None]") -> "Union[str, None]":
@@ -625,30 +625,35 @@ class Module(L5xElement):
         if self._comm_method is not None:
             conn_parts: List[str] = []
             for (conn_name, rpi_str, conn_type) in self._connections:
-                safe_name = html.escape(conn_name, quote=True)
-                # Derive InputTag / OutputTag stubs based on connection type.
-                if conn_type == "Output":
-                    tag_stubs = (
-                        '<OutputTag ExternalAccess="Read/Write">'
-                        '<Comments/>'
-                        '</OutputTag>'
-                    )
+                if conn_type == "RackIn":
+                    conn_parts.append('<RackConnection><InAliasTag/></RackConnection>')
+                elif conn_type == "RackOut":
+                    conn_parts.append('<RackConnection><OutAliasTag/></RackConnection>')
                 else:
-                    # Input or InputOutput: include both stubs.
-                    tag_stubs = (
-                        '<InputTag ExternalAccess="Read Only">'
-                        '<Comments/>'
-                        '</InputTag>'
-                        '<OutputTag ExternalAccess="Read/Write">'
-                        '<Comments/>'
-                        '</OutputTag>'
+                    safe_name = html.escape(conn_name, quote=True)
+                    # Derive InputTag / OutputTag stubs based on connection type.
+                    if conn_type == "Output":
+                        tag_stubs = (
+                            '<OutputTag ExternalAccess="Read/Write">'
+                            '<Comments/>'
+                            '</OutputTag>'
+                        )
+                    else:
+                        # Input or InputOutput: include both stubs.
+                        tag_stubs = (
+                            '<InputTag ExternalAccess="Read Only">'
+                            '<Comments/>'
+                            '</InputTag>'
+                            '<OutputTag ExternalAccess="Read/Write">'
+                            '<Comments/>'
+                            '</OutputTag>'
+                        )
+                    conn_parts.append(
+                        f'<Connection Name="{safe_name}" RPI="{rpi_str}" Type="{conn_type}"'
+                        f' EventID="0" ProgrammaticallySendEventTrigger="false" Unicast="false">'
+                        f'{tag_stubs}'
+                        f'</Connection>'
                     )
-                conn_parts.append(
-                    f'<Connection Name="{safe_name}" RPI="{rpi_str}" Type="{conn_type}"'
-                    f' EventID="0" ProgrammaticallySendEventTrigger="false" Unicast="false">'
-                    f'{tag_stubs}'
-                    f'</Connection>'
-                )
             joined = "".join(conn_parts)
             connections_xml = f'<Connections>{joined}</Connections>' if joined else '<Connections/>'
             comm_xml = (
@@ -932,9 +937,9 @@ class Controller(L5xElement):
         return (
             open_tag
             + redundancy_info
-            + inner
             + '<Security Code="0" ChangesToDetect="16#ffff_ffff_ffff_ffff"/>'
             + '<SafetyInfo/>'
+            + inner
             + '<CST MasterID="0"/>'
             + '<WallClockTime LocalTimeAdjustment="0" TimeZone="0"/>'
             + '<Trends/>'
@@ -1471,13 +1476,34 @@ class ModuleBuilder(L5xElementBuilder):
         # Both are extracted from the hash-named child of RxDataCollection that
         # corresponds to this module's ICP backplane slot (primary) or its IP
         # address (secondary, for EN-connected modules).
+        #
+        # Flex bus I/O modules (1794-*) store their Flex bus address in the same
+        # "slot" field used for ICP backplane slot numbers.  If we pass this to
+        # _comms_from_data_collection it accidentally matches the ICP record for
+        # whatever backplane module happens to sit at that slot number, producing
+        # a wrong CommMethod and spurious <Connection> entries.  Detect Flex I/O
+        # by looking for a Flex port in PORT_STRUCTURES and skip the lookup.
+        _is_flex_io = any(
+            pd.port_type == "Flex"
+            for pd in PORT_STRUCTURES.get((vendor, product_type, product_code), [])
+        )
+
         comm_method: Union[str, None] = None
         connections: List[Tuple[str, str, str]] = []
         extended_properties = ""
-        if slot or ip_address:
+        if not _is_flex_io and (slot or ip_address):
             comm_method, extended_properties = self._comms_from_data_collection(
                 slot, ip_address
             )
+
+        # Rack-optimized discrete Flex I/O (ProductType=7): CommMethod=1073741824.
+        # Input modules (catalog "1794-IB..." / "1794-IP...") use InAliasTag;
+        # output modules (catalog "1794-OB...", "1794-OW...") use OutAliasTag.
+        if _is_flex_io and product_type == 7:
+            comm_method = "1073741824"
+            cat = CATALOG_NUMBERS.get((vendor, product_type, product_code), "")
+            rack_type = "RackIn" if ("IB" in cat or "IP" in cat) else "RackOut"
+            connections = [("__rack__", "", rack_type)]
 
         # Read individual connection records from RxMapConnectionCollection children.
         # Each child's comp_name is the connection Name in the L5X output.
@@ -1487,28 +1513,29 @@ class ModuleBuilder(L5xElementBuilder):
         # RPI: stored at byte offset 0x5C as a u32 (microseconds) in each connection
         # record.  A value of 0 means the binary did not supply an RPI; we default
         # to "200000" (200 ms) which is a safe Logix import default.
-        self._cur.execute(
-            "SELECT c2.comp_name, c2.record FROM comps c1 "
-            "JOIN comps c2 ON c2.parent_id = c1.object_id "
-            "WHERE c1.parent_id = ? AND c1.comp_name = 'RxMapConnectionCollection' "
-            "AND c2.comp_name NOT IN ('Output') "
-            "ORDER BY c2.seq_number",
-            (self._object_id,),
-        )
-        for (conn_name, conn_rec) in self._cur.fetchall():
-            name_lower = conn_name.lower()
-            if "output" in name_lower or name_lower == "config":
-                conn_type = "Output"
-            else:
-                conn_type = "Input"
-            # Extract RPI from offset 0x5C; fall back to 200000 if record is short or zero.
-            conn_bytes = bytes(conn_rec)
-            rpi_val = 0
-            if len(conn_bytes) >= 0x60:
-                rpi_val = struct.unpack("<I", conn_bytes[0x5C:0x60])[0]
-            if rpi_val == 0:
-                rpi_val = 200000
-            connections.append((conn_name, str(rpi_val), conn_type))
+        if not _is_flex_io:
+            self._cur.execute(
+                "SELECT c2.comp_name, c2.record FROM comps c1 "
+                "JOIN comps c2 ON c2.parent_id = c1.object_id "
+                "WHERE c1.parent_id = ? AND c1.comp_name = 'RxMapConnectionCollection' "
+                "AND c2.comp_name NOT IN ('Output') "
+                "ORDER BY c2.seq_number",
+                (self._object_id,),
+            )
+            for (conn_name, conn_rec) in self._cur.fetchall():
+                name_lower = conn_name.lower()
+                if "output" in name_lower or name_lower == "config":
+                    conn_type = "Output"
+                else:
+                    conn_type = "Input"
+                # Extract RPI from offset 0x5C; fall back to 200000 if record is short or zero.
+                conn_bytes = bytes(conn_rec)
+                rpi_val = 0
+                if len(conn_bytes) >= 0x60:
+                    rpi_val = struct.unpack("<I", conn_bytes[0x5C:0x60])[0]
+                if rpi_val == 0:
+                    rpi_val = 200000
+                connections.append((conn_name, str(rpi_val), conn_type))
 
         return Module(
             name,           # L5xElement._name (private)
